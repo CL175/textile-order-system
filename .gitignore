@@ -1,0 +1,27 @@
+# Build output
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Database (keep folder, exclude runtime data)
+data/*.db
+data/*.bak
+
+# Wheels / packages
+wheels/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Claude
+.claude/
