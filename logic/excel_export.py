@@ -87,6 +87,7 @@ def _create_from_template(tpl_path, delivery_path, dn, items, customer,
         ws.title = sheet_name
         _clear_data_area(ws)
         _fill_data(ws, dn, items, customer, layout)
+        _enforce_page_setup(ws)
         wb.save(delivery_path)
     finally:
         wb.close()
@@ -117,6 +118,7 @@ def _append_sheet(delivery_path, dn, items, customer, desired_name, layout):
 
         # Copy page setup from source (print area, margins, orientation, etc.)
         _copy_page_setup(source_ws, target_ws)
+        _enforce_page_setup(target_ws)
 
         wb.save(delivery_path)
     finally:
@@ -235,6 +237,29 @@ def _copy_page_setup(source_ws, target_ws):
         pass  # page setup copy is best-effort
 
 
+def _enforce_page_setup(ws):
+    """强制写入统一的打印设置：90% 缩放、横向、窄边距。
+
+    无论模板原本的页面设置是什么，导出后所有 sheet 一律按此标准，
+    避免打印时多出空白页。
+    """
+    try:
+        ps = ws.page_setup
+        ps.orientation = 'landscape'
+        ps.scale = 90
+        ps.fitToWidth = None
+        ps.fitToHeight = None
+        ps.horizontalCentered = True
+
+        pm = ws.page_margins
+        pm.top = 0.5
+        pm.bottom = 0.5
+        pm.left = 0.25
+        pm.right = 0.25
+    except Exception:
+        pass
+
+
 def _template_dir():
     return Settings.get("template_dir", "D:/xxm/templates")
 
@@ -243,9 +268,9 @@ def _template_dir():
 # Cell / data helpers
 # ---------------------------------------------------------------------------
 def _clear_data_area(ws):
-    """Erase the data rows (7-18, columns B-I)."""
+    """Erase the data rows (7-18, columns B-K)."""
     for r in range(7, 19):
-        for c in range(2, 10):
+        for c in range(2, 12):
             ws["{}{}".format(get_column_letter(c), r)].value = None
 
 
@@ -265,42 +290,35 @@ def _fill_data(ws, dn, items, customer, layout):
     _set(ws, "B5", _format_header(b5_left, b5_right_label + b5_right_val,
                                   layout["b5_right"]), _clean=False)
 
-    # Determine column layout from customer's dn_headers.
-    # Column order: 客户号, 订单号, 制单号, 款号
-    # Data mapping:  col0→customer_code, col1→item_code, col2→mfg_number,
-    # col3→model_number.
-    raw = customer.get("dn_headers") or ""
-    headers = raw.split(",")
-    if len(headers) < 4:
-        headers = [""] + headers  # old 3-field → prepend 客户号
-    has_four = len([h for h in headers[:4] if h.strip()]) >= 4
+    # Dynamic column layout from customer's dn_headers.
+    # Only visible (non-empty header) code columns are written to Excel.
+    # Data columns (品名/颜色/数量/单价/金额/备注) follow immediately after.
+    from db.models import get_column_visibility
+    vis = get_column_visibility(customer.get("dn_headers", ""))
+    code_fields = ["customer_code", "item_code", "mfg_number", "model_number"]
+    visible_codes = [f for f, v in zip(code_fields, vis) if v]
+    data_start_col = 2 + len(visible_codes)  # B=2, then C=3, etc.
 
     for ri, item in enumerate(items):
         row_num = 7 + ri
         if row_num > 18:
             break
-        if has_four:
-            _set(ws, "B{}".format(row_num), item.get("customer_code", ""))
-            _set(ws, "C{}".format(row_num), item.get("item_code", ""))
-            _set(ws, "D{}".format(row_num), item.get("mfg_number", ""))
-            _set(ws, "E{}".format(row_num), item.get("model_number", ""))
-            _set(ws, "F{}".format(row_num), item.get("product_name", ""))
-            _set(ws, "G{}".format(row_num), item.get("color_name", ""))
-            _set(ws, "H{}".format(row_num), item.get("quantity", 0))
-            _set(ws, "I{}".format(row_num), item.get("unit_price", ""))
-            amt = item.get("amount", 0)
-            _set(ws, "J{}".format(row_num), amt if amt else "")
-            _set(ws, "K{}".format(row_num), item.get("notes", ""))
-        else:
-            _set(ws, "B{}".format(row_num), item.get("item_code", ""))
-            _set(ws, "C{}".format(row_num), item.get("model_number", ""))
-            _set(ws, "D{}".format(row_num), item.get("product_name", ""))
-            _set(ws, "E{}".format(row_num), item.get("color_name", ""))
-            _set(ws, "F{}".format(row_num), item.get("quantity", 0))
-            _set(ws, "G{}".format(row_num), item.get("unit_price", ""))
-            amt = item.get("amount", 0)
-            _set(ws, "H{}".format(row_num), amt if amt else "")
-            _set(ws, "I{}".format(row_num), item.get("notes", ""))
+        for ci, field in enumerate(visible_codes):
+            _set(ws, "{}{}".format(get_column_letter(2 + ci), row_num),
+                 item.get(field, ""))
+        _set(ws, "{}{}".format(get_column_letter(data_start_col), row_num),
+             item.get("product_name", ""))
+        _set(ws, "{}{}".format(get_column_letter(data_start_col + 1), row_num),
+             item.get("color_name", ""))
+        _set(ws, "{}{}".format(get_column_letter(data_start_col + 2), row_num),
+             item.get("quantity", 0))
+        _set(ws, "{}{}".format(get_column_letter(data_start_col + 3), row_num),
+             item.get("unit_price", ""))
+        amt = item.get("amount", 0)
+        _set(ws, "{}{}".format(get_column_letter(data_start_col + 4), row_num),
+             amt if amt else "")
+        _set(ws, "{}{}".format(get_column_letter(data_start_col + 5), row_num),
+             item.get("notes", ""))
 
     # 【核心修改】：删除了这里强行将页面缩放比例写死为 fitToWidth=1 的代码
     # 以保证程序完全尊重每个客户独立模板的原始打印设置。
@@ -324,14 +342,12 @@ def _fill_data(ws, dn, items, customer, layout):
                 total_pieces += 1
         else:
             total_pieces += 1
-    if has_four:
-        _set(ws, "I19", u"合计金额:")
-        _set(ws, "J19", total_amt if total_amt else "")
-        _set(ws, "K19", u"共{}个".format(total_pieces))
-    else:
-        _set(ws, "G19", u"合计金额:")
-        _set(ws, "H19", total_amt if total_amt else "")
-        _set(ws, "I19", u"共{}个".format(total_pieces))
+    _set(ws, "{}{}".format(get_column_letter(data_start_col + 3), 19),
+         u"合计金额:")
+    _set(ws, "{}{}".format(get_column_letter(data_start_col + 4), 19),
+         total_amt if total_amt else "")
+    _set(ws, "{}{}".format(get_column_letter(data_start_col + 5), 19),
+         u"共{}个".format(total_pieces))
 
 
 def _format_header(left, right, right_pos):

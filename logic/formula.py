@@ -104,6 +104,45 @@ def parse_formula(raw):
     }
 
 
+def expand_formula(raw):
+    """Expand a quantity formula into individual label items.
+
+    Returns list of dicts with keys:
+        quantity (float): the quantity value for this label
+        count (int): how many labels to print with this quantity
+    """
+    if not raw:
+        return []
+    s = raw.strip()
+    if s.startswith("="):
+        s = s[1:].strip()
+    if not s:
+        return []
+    s = s.replace(" ", "").replace("\t", "")
+    if not re.match(r'^[\d+\-*/.]+$', s):
+        return []
+    items = []
+    for term in s.split("+"):
+        if not term:
+            continue
+        if "*" in term:
+            parts = term.split("*")
+            try:
+                qty = float(eval(parts[0], {"__builtins__": {}}, {}))
+                cnt = int(float(parts[-1]))
+                if cnt > 0:
+                    items.append({"quantity": qty, "count": cnt})
+            except (ValueError, IndexError, SyntaxError):
+                items.append({"quantity": 0, "count": 1})
+        else:
+            try:
+                qty = float(eval(term, {"__builtins__": {}}, {}))
+                items.append({"quantity": qty, "count": 1})
+            except (ValueError, SyntaxError):
+                pass
+    return items
+
+
 def _empty_result():
     return {
         "quantity": 0,

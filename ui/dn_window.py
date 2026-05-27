@@ -11,7 +11,7 @@ except ImportError:
 
 import json
 from db.models import (Customer, Product, Color, Order, OrderItem,
-                       DeliveryNote, DNItem, Settings)
+                       DeliveryNote, DNItem, Settings, get_column_visibility)
 from logic.formula import parse_formula
 from logic.order_number import generate_delivery_number
 from ui.excel_grid import ExcelGrid
@@ -205,12 +205,17 @@ class DeliveryNoteWindow(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _safe_ui(self, fn):
-        def _run():
-            try:
-                fn()
-            except tk.TclError:
-                pass
-        self.after(0, _run)
+        """线程安全的 UI 更新：双重拦截 TclError 与窗口销毁异常"""
+        try:
+            if self.winfo_exists():
+                def _run():
+                    try:
+                        fn()
+                    except tk.TclError:
+                        pass
+                self.after(0, _run)
+        except Exception:
+            pass
 
     def _build(self):
         # ---- Big Title ----
@@ -279,7 +284,8 @@ class DeliveryNoteWindow(tk.Toplevel):
             search_cols={
                 C_NAME: lambda r, c: self._search_product(r, c),
                 C_COLOR: lambda r, c: self._search_color(r, c),
-            })
+            },
+            highlight_cols={7} if (self._customer and self._customer.get("needs_price")) else None)
         self.grid.on_cell_changed = self._on_grid_cell_changed
         self.grid.on_resize_done = self._save_grid_widths
         if self.read_only:
@@ -602,7 +608,7 @@ class DeliveryNoteWindow(tk.Toplevel):
                             customer["id"], dd or None)
                     if not dn_str:
                         if not silent:
-                            self.after(0, lambda: messagebox.showwarning(
+                            self._safe_ui(lambda: messagebox.showwarning(
                                 u"提示", u"请输入送货单号。"))
                         self._safe_ui(lambda: self._btn_save.config(state="normal"))
                         return
@@ -619,7 +625,7 @@ class DeliveryNoteWindow(tk.Toplevel):
                             "INSERT OR IGNORE INTO delivery_note_order"
                             " (delivery_note_id, order_id) VALUES (?,?)",
                             (dnid, order_id))
-                    self.after(0, lambda: setattr(self, 'dn_id', dnid))
+                    self._safe_ui(lambda: setattr(self, 'dn_id', dnid))
 
                 for i, row in enumerate(data):
                     if not row[C_NAME]:
@@ -676,7 +682,7 @@ class DeliveryNoteWindow(tk.Toplevel):
                 conn.commit()
                 self._dirty = False
                 if not silent:
-                    self.after(0, lambda: messagebox.showinfo(
+                    self._safe_ui(lambda: messagebox.showinfo(
                         u"保存成功", u"送货单已保存。\n单号: {}".format(dn_str)))
                 if callback:
                     self._safe_ui(callback)
@@ -688,7 +694,7 @@ class DeliveryNoteWindow(tk.Toplevel):
                 except:
                     pass
                 if not silent:
-                    self.after(0, lambda: messagebox.showerror(
+                    self._safe_ui(lambda: messagebox.showerror(
                         u"保存失败", str(e)))
             finally:
                 conn.close()
@@ -697,6 +703,21 @@ class DeliveryNoteWindow(tk.Toplevel):
         t = threading.Thread(target=do_save)
         t.daemon = True
         t.start()
+
+    def _apply_column_visibility(self):
+        """Hide code columns whose dn_headers label is empty for this customer."""
+        if not self._customer:
+            return
+        vis = get_column_visibility(self._customer.get("dn_headers", ""))
+        code_cols = [C_CUST_CODE, C_ORDER_NO, C_MFG_NO, C_MODEL]
+        defaults = [80, 110, 110, 80]
+        for i, visible in enumerate(vis):
+            if visible:
+                self.grid.col_widths[code_cols[i]] = max(
+                    self.grid.col_widths[code_cols[i]], defaults[i])
+            else:
+                self.grid.col_widths[code_cols[i]] = 0
+        self.grid.draw()
 
     def _load_from_order(self):
         if self._customer:
@@ -709,14 +730,15 @@ class DeliveryNoteWindow(tk.Toplevel):
             formula = item.get("quantity_formula") or ""
             q = item["quantity"] if item["quantity"] else ""
             qty_cell = formula if formula else (str(q) if q else "")
-            rows.append([item.get("order_number", ""),
+            rows.append([item.get("customer_code", ""),
+                         item.get("order_number", ""),
                          item.get("mfg_number", ""),
                          item["model_number"],
-                         item.get("customer_code", ""),
                          item["product_name"],
                          item["color_name"], qty_cell,
                          "", "", item["notes"] if item["notes"] else ""])
         self.grid.set_data(rows)
+        self._apply_column_visibility()
         self._recalc()
 
     def _load_dn(self):
@@ -752,14 +774,15 @@ class DeliveryNoteWindow(tk.Toplevel):
             else:
                 q = item["quantity"] if item["quantity"] else ""
                 qty_cell = str(q) if q else ""
-            rows.append([item.get("item_code", ""), item.get("mfg_number", ""),
-                         item["model_number"], item.get("customer_code", ""),
+            rows.append([item.get("customer_code", ""), item.get("item_code", ""),
+                         item.get("mfg_number", ""), item["model_number"],
                          item["product_name"],
                          item["color_name"], qty_cell,
                          item["unit_price"] if item["unit_price"] else "",
                          "{:.2f}".format(item["amount"]) if item["amount"] else "",
                          item["notes"] if item["notes"] else ""])
         self.grid.set_data(rows)
+        self._apply_column_visibility()
         self._recalc()
         self._loading = False
         self._dirty = False
@@ -856,6 +879,10 @@ class DeliveryNoteWindow(tk.Toplevel):
         dn = DeliveryNote.get_by_id(self.dn_id)
         if not dn:
             return None
+        if dn.get("status") == "completed":
+            if not silent:
+                messagebox.showinfo(u"提示", u"该送货单已是完单状态，不支持再次导出。")
+            return None
         export_cnt = dn.get("export_count", 0)
         if export_cnt >= 1 and not silent:
             msg = u"此送货单已导出过 {} 次，是否再次导出？".format(export_cnt)
@@ -928,17 +955,17 @@ class DeliveryNoteWindow(tk.Toplevel):
             try:
                 # 尝试用我们修复好的 WPS COM 打印
                 _wps_print_last_sheet(filepath)
-                self.after(0, lambda: messagebox.showinfo(
+                self._safe_ui(lambda: messagebox.showinfo(
                     u"打印完成", u"送货单已成功发送至打印机。\n\n文件保存于：{}".format(filepath)))
 
             except Exception as e:
                 # 【第四道保险】COM 彻底崩溃时的系统级兜底方案
                 try:
                     os.startfile(filepath, "print")
-                    self.after(0, lambda: messagebox.showinfo(
+                    self._safe_ui(lambda: messagebox.showinfo(
                         u"打印提示", u"使用了系统备用打印通道发送完成。"))
                 except Exception as fallback_e:
-                    self.after(0, lambda: messagebox.showerror(
+                    self._safe_ui(lambda: messagebox.showerror(
                         u"打印彻底失败", u"WPS接口及系统打印均失败：\n{}".format(str(e))))
 
             finally:

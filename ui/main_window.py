@@ -115,6 +115,8 @@ class MainWindow(object):
         self.filter_date_to = DateEntry(self._normal_bar, width=16)
         self.filter_date_to.pack(side=tk.LEFT, padx=(0, 8))
 
+        ttk.Label(self._normal_bar, text=u"名称:").pack(
+            side=tk.LEFT, padx=(0, 2))
         self.filter_keyword = ttk.Entry(self._normal_bar, width=16)
         self.filter_keyword.pack(side=tk.LEFT, padx=(0, 4))
         self.filter_keyword.bind("<Return>", lambda e: self._load_data())
@@ -234,8 +236,8 @@ class MainWindow(object):
         style.configure("Treeview.Heading",
                         font=("Microsoft YaHei", 10, "bold"))
 
-        self._order_cols = ("display_name", "customer_name", "order_date",
-                            "delivery_number", "status", "item_count")
+        self._order_cols = ("status", "display_name", "customer_name",
+                            "order_date", "delivery_number", "item_count")
         self._dn_cols = ("delivery_number", "customer_name", "delivery_date",
                          "order_display_name", "status")
 
@@ -319,6 +321,12 @@ class MainWindow(object):
         # Validate date format (YYYY-MM-DD) before applying
         if df and len(df) >= 10 and df[4] == "-" and df[7] == "-":
             filters["date_from"] = df[:10]
+        else:
+            # 默认只拉取近 30 天数据，防止历史数据过多卡死界面
+            import datetime
+            filters["date_from"] = (
+                datetime.date.today() - datetime.timedelta(days=30)
+            ).strftime("%Y-%m-%d")
         if dt and len(dt) >= 10 and dt[4] == "-" and dt[7] == "-":
             filters["date_to"] = dt[:10]
 
@@ -372,9 +380,10 @@ class MainWindow(object):
                                      values=vals, tags=tuple(tags))
                 else:
                     self.tree.insert("", tk.END, iid=str(row["id"]), values=(
+                        sc,
                         row["display_name"], row["customer_name"],
                         row["order_date"], row["delivery_number"] or "",
-                        sc, Order.get_item_count(row["id"])), tags=(tag,))
+                        Order.get_item_count(row["id"])), tags=(tag,))
         else:
             result = DeliveryNote.get_all(
                 page=self.current_page, page_size=self.PAGE_SIZE,

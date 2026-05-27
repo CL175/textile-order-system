@@ -16,7 +16,7 @@ class Customer(object):
     FIELDS = [
         "name", "prefix", "contact_person", "phone", "email",
         "address", "notes", "has_model_number", "has_item_code",
-        "excel_file_path", "print_template", "dn_headers"
+        "excel_file_path", "print_template", "dn_headers", "needs_price"
     ]
 
     @staticmethod
@@ -29,7 +29,7 @@ class Customer(object):
             "address": "", "notes": "",
             "has_model_number": 1, "has_item_code": 1,
             "excel_file_path": "", "print_template": "",
-            "dn_headers": ",订单号,,款号",
+            "dn_headers": ",订单号,,款号", "needs_price": 0,
             "created_at": now, "updated_at": now
         }
         vals.update(kwargs)
@@ -353,6 +353,21 @@ class Order(object):
         finally:
             c.close()
 
+    @classmethod
+    def get_recent(cls, days=30):
+        """只获取最近 N 天的订单，防止历史数据卡死界面"""
+        c = get_connection()
+        try:
+            rows = c.execute(
+                "SELECT o.*, c.name as customer_name, c.prefix as customer_prefix"
+                " FROM orders o JOIN customer c ON o.customer_id = c.id"
+                " WHERE o.order_date >= date('now', 'localtime', ?)"
+                " ORDER BY o.order_date DESC, o.id DESC",
+                ('-{} days'.format(days),)).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            c.close()
+
     @staticmethod
     def get_by_display_name(display_name):
         c = get_connection()
@@ -657,6 +672,22 @@ class DeliveryNote(object):
         finally:
             c.close()
 
+    @classmethod
+    def get_recent(cls, days=30):
+        """只获取最近 N 天的送货单"""
+        c = get_connection()
+        try:
+            rows = c.execute(
+                "SELECT dn.*, c.name as customer_name, c.id as customer_id"
+                " FROM delivery_note dn"
+                " LEFT JOIN customer c ON dn.customer_id = c.id"
+                " WHERE dn.delivery_date >= date('now', 'localtime', ?)"
+                " ORDER BY dn.delivery_date DESC, dn.id DESC",
+                ('-{} days'.format(days),)).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            c.close()
+
     @staticmethod
     def get_by_order(order_id, page=1, page_size=50):
         c = get_connection()
@@ -728,8 +759,9 @@ class DeliveryNote(object):
                 if filters.get("keyword"):
                     kw = "%{}%".format(filters["keyword"])
                     query += (" AND (dn.delivery_number LIKE ?"
-                              " OR c.name LIKE ?)")
-                    params.extend([kw, kw])
+                              " OR c.name LIKE ?"
+                              " OR o.display_name LIKE ?)")
+                    params.extend([kw, kw, kw])
 
             count_sql = query.replace(
                 "SELECT dn.*,"
@@ -972,6 +1004,20 @@ def deduplicate_dn_items(items):
             cur["mfg_number"] = ""
             cur["item_code"] = ""
     return items
+
+
+def get_column_visibility(dn_headers):
+    """Parse customer dn_headers into a 4-bool visibility mask.
+
+    Returns a list of 4 bools: [customer_code, 订单号, 制单号, 款号].
+    True = column has a non-empty header → should be visible.
+    Handles old 3-field format by prepending an empty 客户号 slot.
+    """
+    headers = (dn_headers or "").split(",")
+    if len(headers) < 4:
+        headers = [""] + headers
+    return [bool((headers[i] if i < len(headers) else "").strip())
+            for i in range(4)]
 
 
 class Settings(object):

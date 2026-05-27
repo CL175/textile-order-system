@@ -11,7 +11,7 @@ except ImportError:
 
 import json
 from db.models import (Customer, Product, Color, Order, OrderItem, Settings,
-                       deduplicate_dn_items)
+                       deduplicate_dn_items, get_column_visibility)
 from logic.order_number import generate_delivery_number
 from ui.excel_grid import ExcelGrid
 from ui.widgets import DatePicker
@@ -44,6 +44,9 @@ class OrderWindow(tk.Toplevel):
         self._customers = Customer.get_all()
         self._dirty = False
         self._last_cust_name = ""
+        self._full_rows = []          # master copy of all rows
+        self._filter_index_map = []    # filtered-row → full-row mapping
+        self._filter_entries = {}      # col → (StringVar, Entry)
 
         if self.order_id:
             self.title(u"编辑订单")
@@ -70,12 +73,17 @@ class OrderWindow(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _safe_ui(self, fn):
-        """Run fn in main thread, silently ignore if window destroyed."""
-        def _run():
-            try:
-                fn()
-            except tk.TclError:
-                pass  # widget already destroyed
+        """线程安全的 UI 更新：双重拦截 TclError 与窗口销毁异常"""
+        try:
+            if self.winfo_exists():
+                def _run():
+                    try:
+                        fn()
+                    except tk.TclError:
+                        pass
+                self.after(0, _run)
+        except Exception:
+            pass
         self.after(0, _run)
 
     def _build(self):
@@ -150,15 +158,12 @@ class OrderWindow(tk.Toplevel):
             checkbox_col=self.CHECKBOX_COL,
             extra_checkbox_cols={1},  # 推送列
             read_only_cols={10},    # 状态列冻结
-            search_cols={
-                5: lambda r, c: self._search_product(r, c),
-                7: lambda r, c: self._search_color(r, c),
-            })
+            search_cols={})         # 清空弹窗库，恢复直接打字输入
 
         if self.read_only:
             pass
 
-        self.grid.on_cell_changed = lambda r, c, v: setattr(self, '_dirty', True)
+        self.grid.on_cell_changed = self._on_grid_cell_changed
         self.grid.on_resize_done = self._save_grid_widths
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -166,14 +171,23 @@ class OrderWindow(tk.Toplevel):
         if self.read_only:
             self.grid.read_only = True
             self.grid.on_edit_blocked = self._on_readonly_edit
+
+        # ---- Filter Bar (放在表头和数据之间) ----
+        self._filter_bar = tk.Frame(self, height=42, bg="#e8e8e8")
+        self._filter_bar.pack(fill=tk.X, padx=10, pady=(0, 2))
+        self._filter_bar.pack_propagate(False)
+
         self.grid.pack(fill=tk.BOTH, expand=True, padx=10, pady=2)
+        self._build_filter_bar()
+        # 接管底层表格的 add_row，确保新行同步到 _full_rows
+        self.grid.add_row = self._add_row
 
         # ---- Footer ----
         ft = tk.Frame(self)
         ft.pack(fill=tk.X)
 
         ttk.Button(ft, text=u"添加行",
-                   command=lambda: self.grid.add_row()).pack(
+                   command=lambda: self._add_row()).pack(
                        side=tk.LEFT, padx=2)
         ttk.Button(ft, text=u"删除选中行",
                    command=self._del_rows).pack(side=tk.LEFT, padx=2)
@@ -209,19 +223,23 @@ class OrderWindow(tk.Toplevel):
         menu.add_command(label=u"打印全选", command=self._select_all_print)
         menu.add_command(label=u"推送全选", command=self._select_all_push)
         menu.add_separator()
-        menu.add_command(label=u"添加行", command=lambda: self.grid.add_row())
+        menu.add_command(label=u"添加行", command=lambda: self._add_row())
         menu.tk_popup(event.x_root, event.y_root)
 
     def _select_all_print(self):
         for ri in range(self.grid.row_count()):
-            if self.grid.get_cell(ri, 4):  # has product name
+            if self.grid.get_cell(ri, 6):  # has product name
                 self.grid.set_cell(ri, 0, u"☑")
+                if self.grid.on_cell_changed:
+                    self.grid.on_cell_changed(ri, 0, u"☑")
         self.grid.draw()
 
     def _select_all_push(self):
         for ri in range(self.grid.row_count()):
-            if self.grid.get_cell(ri, 4):  # has product name
+            if self.grid.get_cell(ri, 6):  # has product name
                 self.grid.set_cell(ri, 1, u"☑")
+                if self.grid.on_cell_changed:
+                    self.grid.on_cell_changed(ri, 1, u"☑")
         self.grid.draw()
 
     # ================================================================
@@ -247,6 +265,7 @@ class OrderWindow(tk.Toplevel):
 
     def _on_customer_change(self, e=None):
         self._auto_name()
+        self._apply_column_visibility()
 
     def _auto_name(self):
         cust = self._get_customer()
@@ -275,10 +294,31 @@ class OrderWindow(tk.Toplevel):
     # ================================================================
     # Row ops
     # ================================================================
+    def _add_row(self, values=None):
+        """新增行：支持底层表格敲回车触发，自动继承过滤栏内容防止行消失"""
+        if values:
+            row = list(values)
+        else:
+            row = [u"☐" if i == 0 or i == 1 else ""
+                   for i in range(len(self.COLUMNS))]
+            for ci, (var, _) in self._filter_entries.items():
+                val = var.get().strip()
+                if val:
+                    row[ci] = val
+        self._full_rows.append(row)
+        self._apply_filters()
+        # 滚动到底部
+        self.grid.canvas.update_idletasks()
+        self.grid.canvas.yview_moveto(1.0)
+
     def _del_rows(self):
         sel = self.grid.get_selected_rows()
         if sel:
-            self.grid.delete_rows(sel)
+            full_sel = sorted([self._map_row(r) for r in sel], reverse=True)
+            for fi in full_sel:
+                if fi < len(self._full_rows):
+                    self._full_rows.pop(fi)
+            self._apply_filters()
         else:
             messagebox.showinfo(u"提示", u"请先勾选要删除的行。")
 
@@ -289,32 +329,80 @@ class OrderWindow(tk.Toplevel):
             return
 
         self.grid.commit_edit()
-        data = self.grid.get_data()
+        data = self._get_full_data()
         checked = [(ri, row) for ri, row in enumerate(data)
                    if row[0] == u"☑" and row[6]]
         if not checked:
             messagebox.showinfo(u"提示", u"请先勾选要打印的行（点击☐变☑）。")
             return
 
-        if not messagebox.askyesno(
-                u"标签打印",
-                u"将打印 {} 行标签（含打印张数）。\n\n"
-                u"请确认 BarTender 已打开标签模板。".format(len(checked))):
+        # Build print items.  Formula quantities are expanded into
+        # sub-items so that each sub-quantity prints the right number
+        # of labels without missing any trailing terms.
+        items = []
+        total_label_count = 0
+        row_label_counts = {}
+
+        for ri, row in checked:
+            qty_raw = (row[8] if len(row) > 8 else "").strip()
+            pc_raw = (row[9] if len(row) > 9 else "").strip()
+
+            # 获取用户在界面上手动指定的张数，默认为 1
+            try:
+                manual_pc = int(pc_raw) if pc_raw else 1
+            except ValueError:
+                manual_pc = 1
+
+            # 核心判断：复杂连加公式（含有+或*）才走 expand_formula 拆分；
+            # 纯数字严格尊重手动修改的张数，不走公式拆分。
+            if u"+" in qty_raw or u"*" in qty_raw:
+                from logic.formula import expand_formula
+                sub_items = expand_formula(qty_raw)
+            else:
+                sub_items = []
+
+            row_total = 0
+
+            if sub_items:
+                # 带有 + 或 * 的复杂公式流：各拆分项自带张数
+                for si in sub_items:
+                    items.append({
+                        "customer_code": row[2] if len(row) > 2 else "",
+                        "order_number": row[3],
+                        "item_code": row[4],
+                        "model_number": row[5],
+                        "product_name": row[6],
+                        "color_name": row[7],
+                        "quantity": str(si["quantity"]),
+                        "print_count": si["count"],
+                    })
+                    row_total += si["count"]
+            else:
+                # 纯数字输入流（例如：50米）：数量直接用输入的文本，张数严格采用手动输入修改后的 manual_pc
+                items.append({
+                    "customer_code": row[2] if len(row) > 2 else "",
+                    "order_number": row[3],
+                    "item_code": row[4],
+                    "model_number": row[5],
+                    "product_name": row[6],
+                    "color_name": row[7],
+                    "quantity": qty_raw,
+                    "print_count": manual_pc,
+                })
+                row_total = manual_pc
+
+            row_label_counts[ri] = row_total
+            total_label_count += row_total
+
+        if not items:
+            messagebox.showinfo(u"提示", u"没有可打印的标签。")
             return
 
-        # Build item list for label printer
-        items = []
-        for ri, row in checked:
-            items.append({
-                "customer_code": row[2] if len(row) > 2 else "",
-                "order_number": row[3],
-                "item_code": row[4],
-                "model_number": row[5],
-                "product_name": row[6],
-                "color_name": row[7],
-                "quantity": row[8] if len(row) > 8 else "",
-                "print_count": row[9] if len(row) > 9 else 1,
-            })
+        if not messagebox.askyesno(
+                u"标签打印",
+                u"将打印 {} 张标签。\n\n"
+                u"请确认 BarTender 已打开标签模板。".format(total_label_count)):
+            return
 
         order_info = {
             "display_name": self.name_var.get().strip(),
@@ -336,10 +424,12 @@ class OrderWindow(tk.Toplevel):
             messagebox.showerror(u"打印失败", str(e))
             return
 
-        # Mark checked items as printed
+        # Update print count display in grid
         items_db = OrderItem.get_by_order(self.order_id)
         for ri, row in checked:
             self.grid.set_cell(ri, 0, u"☑")
+            if ri in row_label_counts:
+                self.grid.set_cell(ri, 9, str(row_label_counts[ri]))
             if ri < len(items_db):
                 OrderItem.update(items_db[ri]["id"], is_printed=1)
         self.grid.draw()
@@ -353,7 +443,7 @@ class OrderWindow(tk.Toplevel):
             messagebox.showwarning(u"提示", u"请先选择客户。")
             return
 
-        data = self.grid.get_data()
+        data = self._get_full_data()
         checked = [row for row in data if row[1] == u"☑" and row[6]]
         if not checked:
             messagebox.showinfo(u"提示", u"请先勾选要推送的行（点击推送列切换☑）。")
@@ -396,7 +486,7 @@ class OrderWindow(tk.Toplevel):
 
                 dn_str = generate_delivery_number(customer_id, None)
                 if not dn_str:
-                    self.after(0, lambda: messagebox.showwarning(
+                    self._safe_ui(lambda: messagebox.showwarning(
                         u"错误", u"无法生成送货单号。"))
                     return
 
@@ -440,6 +530,7 @@ class OrderWindow(tk.Toplevel):
                 # Deduplicate consecutive rows with same 款号+制单号+订单号
                 deduplicate_dn_items(items)
 
+                from logic.formula import parse_formula
                 for idx, item in enumerate(items):
                     mn = item["_orig_model"]
                     pn = item["product_name"]
@@ -454,10 +545,20 @@ class OrderWindow(tk.Toplevel):
                         (pn, mn)).fetchone()
                     conn.execute(
                         "INSERT OR IGNORE INTO color (name) VALUES (?)", (cn,))
-                    try:
-                        q = float(item["quantity_formula"]) if item["quantity_formula"] else 0
-                    except ValueError:
-                        q = 0
+
+                    # 推送到送货单时，强行将 1+1 融合成汇总数字 2
+                    q_raw = item["quantity_formula"]
+                    res = parse_formula(q_raw)
+                    if not res.get("error"):
+                        q = float(res["quantity"])
+                        q_formula_pushed = str(int(q)) if q.is_integer() else str(q)
+                    else:
+                        try:
+                            q = float(q_raw) if q_raw else 0.0
+                        except ValueError:
+                            q = 0.0
+                        q_formula_pushed = q_raw
+
                     conn.execute(
                         "INSERT INTO delivery_note_item (delivery_note_id,"
                         " model_number, item_code, customer_code,"
@@ -469,8 +570,10 @@ class OrderWindow(tk.Toplevel):
                          "" if not item["model_number"] else (pr["model_number"] if pr else mn),
                          item["item_code"],
                          item.get("customer_code", ""),
-                         pn, cn, item["quantity_formula"],
-                         q, "",
+                         pn, cn,
+                         q_formula_pushed,
+                         q,
+                         (res.get("notes", "") if q_raw else ""),
                          item["mfg_number"],
                          idx, now, now))
 
@@ -496,6 +599,7 @@ class OrderWindow(tk.Toplevel):
                 conn.commit()
 
                 def update_ui():
+                    self._clear_filters()
                     for ri in checked_rows:
                         grid.set_cell(ri, 1, u"☐")
                         cur_val = grid.get_cell(ri, 10)
@@ -518,11 +622,11 @@ class OrderWindow(tk.Toplevel):
                     conn.rollback()
                 except:
                     pass
-                self.after(0, lambda: messagebox.showerror(
+                self._safe_ui(lambda: messagebox.showerror(
                     u"推送失败", str(e)))
             finally:
                 conn.close()
-                self.after(0, lambda: self._safe_ui(
+                self._safe_ui(lambda: self._safe_ui(
                     lambda: (self.config(cursor=""),
                              _safe_btn_config(self.push_btn, state=tk.NORMAL))))
 
@@ -666,7 +770,7 @@ class OrderWindow(tk.Toplevel):
             return False
 
         self.grid.commit_edit()
-        data = self.grid.get_data()
+        data = self._get_full_data()
         items = [row for row in data if row[6]]
         if not items:
             if not silent:
@@ -692,10 +796,19 @@ class OrderWindow(tk.Toplevel):
                     continue
                 p = Product.find_or_create(row[5], "", row[6])
                 c = Color.find_or_create(row[7])
-                try:
-                    qty = float(row[8]) if row[8] else 0
-                except ValueError:
-                    qty = 0
+
+                # 修复数量与公式存储
+                qty_raw = str(row[8]).strip() if row[8] else ""
+                from logic.formula import parse_formula
+                res = parse_formula(qty_raw)
+                if not res.get("error"):
+                    qty = float(res["quantity"])
+                else:
+                    try:
+                        qty = float(qty_raw) if qty_raw else 0.0
+                    except ValueError:
+                        qty = 0.0
+
                 try:
                     pc = int(row[9]) if row[9] else 1
                 except ValueError:
@@ -704,6 +817,7 @@ class OrderWindow(tk.Toplevel):
                     p_cnt = int(row[10]) if len(row) > 10 and row[10] else 0
                 except ValueError:
                     p_cnt = 0
+
                 OrderItem.create(
                     order_id=oid, product_id=p["id"],
                     color_id=c["id"],
@@ -711,7 +825,9 @@ class OrderWindow(tk.Toplevel):
                     item_code=p["item_code"],
                     product_name=p["product_name"],
                     color_name=c["name"],
-                    quantity_formula="", quantity=qty,
+                    # 将表格里输入的原始公式字符串（如 1+1）完好无损地存入数据库
+                    quantity_formula=qty_raw,
+                    quantity=qty,
                     print_count=pc,
                     is_printed=1 if row[0] == u"☑" else 0,
                     push_count=p_cnt,
@@ -742,6 +858,139 @@ class OrderWindow(tk.Toplevel):
                 messagebox.showerror(u"保存失败", str(e))
             return False
 
+    # ---- Filter bar ----
+    def _build_filter_bar(self):
+        """创建与列宽完美对齐的过滤输入框"""
+        for w in self._filter_bar.winfo_children():
+            w.destroy()
+        self._filter_entries.clear()
+
+        filter_cols = [2, 3, 4, 5, 6, 7]  # 客户号..颜色
+        for ci in filter_cols:
+            var = tk.StringVar()
+            var.trace("w", lambda *a, c=ci: self._on_filter_change(c))
+            entry = tk.Entry(self._filter_bar, textvariable=var, width=8,
+                             font=("Microsoft YaHei", 10), bg="#ffffcc",
+                             relief="solid", borderwidth=1)
+            self._filter_entries[ci] = (var, entry)
+
+        self._clear_btn = tk.Button(self._filter_bar, text=u"一键清空",
+                                    font=("Microsoft YaHei", 8),
+                                    command=self._clear_filters)
+        self._update_filter_layout()
+
+    def _update_filter_layout(self):
+        """根据表格的最新列宽，动态调整过滤输入框的绝对坐标"""
+        x_offset = 0
+        for i in range(len(self.COLUMNS)):
+            w = self.grid.col_widths[i] if i < len(self.grid.col_widths) else 80
+            if i in self._filter_entries and w > 0:
+                var, entry = self._filter_entries[i]
+                entry.place(x=x_offset + 2, y=4, width=w - 4, height=35)
+                entry.lift()
+            elif i in self._filter_entries:
+                self._filter_entries[i][1].place_forget()
+            x_offset += w
+        self._clear_btn.place(x=x_offset + 10, y=4, height=35)
+
+    def _on_filter_change(self, col):
+        """任意输入框内容改变时，实时触发过滤"""
+        self._apply_filters()
+
+    def _apply_filters(self):
+        """核心计算：执行多列 AND 条件的模糊匹配"""
+        if not getattr(self, '_full_rows', None):
+            self._filter_index_map = []
+            self.grid.set_data([])
+            return
+
+        # 1. 收集所有当前填写的非空过滤条件
+        filters = {}
+        for ci, (var, _) in self._filter_entries.items():
+            kw = var.get().strip().lower()
+            if kw:
+                filters[ci] = kw
+
+        # 2. 计算筛选后的结果集
+        if not filters:
+            mapped = list(range(len(self._full_rows)))
+            filtered = [list(r) for r in self._full_rows]
+        else:
+            mapped = []
+            for fi, row in enumerate(self._full_rows):
+                match = True
+                for ci, kw in filters.items():
+                    val = str(row[ci] if ci < len(row) else "").lower()
+                    if kw not in val:
+                        match = False
+                        break
+                if match:
+                    mapped.append(fi)
+            filtered = [list(self._full_rows[i]) for i in mapped]
+
+        self._filter_index_map = mapped
+
+        # 不挂载任何显示覆盖，列表中原本是什么文本就永远显示什么文本
+        self.grid.clear_overrides()
+        self.grid.set_data(filtered)
+
+    def _clear_filters(self):
+        """一键清空所有过滤框"""
+        for var, _ in self._filter_entries.values():
+            var.set("")
+        self._apply_filters()
+
+    def _map_row(self, filtered_row):
+        """Translate filtered row index → full row index."""
+        if self._filter_index_map and filtered_row < len(self._filter_index_map):
+            return self._filter_index_map[filtered_row]
+        return filtered_row  # fallback: identity map
+
+    def _get_full_data(self):
+        """Return the master (unfiltered) row list."""
+        return [list(r) for r in self._full_rows]
+
+    def _apply_column_visibility(self):
+        """Hide code columns whose dn_headers label is empty for this customer."""
+        cust = self._get_customer()
+        if not cust:
+            return
+        vis = get_column_visibility(cust.get("dn_headers", ""))
+        code_cols = [2, 3, 4, 5]  # 客户号, 订单号, 制单号, 款号
+        defaults = [80, 100, 100, 80]
+        for i, visible in enumerate(vis):
+            if visible:
+                self.grid.col_widths[code_cols[i]] = max(
+                    self.grid.col_widths[code_cols[i]], defaults[i])
+            else:
+                self.grid.col_widths[code_cols[i]] = 0
+        self.grid.draw()
+        self._update_filter_layout()
+
+    def _on_grid_cell_changed(self, row, col, new_val):
+        self._dirty = True
+        full_row = self._map_row(row)
+        if full_row < len(self._full_rows) and col < len(self._full_rows[full_row]):
+            self._full_rows[full_row][col] = new_val
+        if col == 8:
+            self._auto_calc_print_count(row, new_val)
+        # Re-apply filter in case the edit changed which rows match
+        if any(var.get().strip() for var, _ in self._filter_entries.values()):
+            self._apply_filters()
+
+    def _auto_calc_print_count(self, row, qty_raw):
+        """当输入数量如 10*2+3 时，自动算出张数并填入第9列"""
+        if not qty_raw:
+            return
+        from logic.formula import parse_formula
+        res = parse_formula(qty_raw)
+        if not res.get("error") and res.get("piece_count", 0) > 0:
+            full_row = self._map_row(row)
+            if full_row < len(self._full_rows):
+                self._full_rows[full_row][9] = str(res["piece_count"])
+            self.grid.set_cell(row, 9, str(res["piece_count"]))
+            self.grid.draw()
+
     def _load_order(self):
         o = Order.get_by_id(self.order_id)
         if not o:
@@ -762,7 +1011,13 @@ class OrderWindow(tk.Toplevel):
         for item in items:
             mk = u"☑" if item["is_printed"] else u"☐"
             pc = item["print_count"] if item["print_count"] else 1
-            qty = item["quantity"] if item["quantity"] else ""
+
+            # 优先提取当初存进去的原始公式文本（如 1+1）
+            qty = item.get("quantity_formula") or ""
+            if not qty:
+                q_num = item["quantity"] if item["quantity"] else ""
+                qty = str(int(q_num)) if isinstance(q_num, float) and q_num.is_integer() else str(q_num) if q_num else ""
+
             push_cnt = item.get("push_count") or 0
             rows.append([
                 mk,
@@ -773,11 +1028,13 @@ class OrderWindow(tk.Toplevel):
                 item["model_number"],
                 item["product_name"],
                 item["color_name"],
-                str(qty) if qty else "",
+                qty,
                 str(pc),
                 str(push_cnt) if push_cnt else "",
             ])
-        self.grid.set_data(rows)
+        self._full_rows = rows
+        self._apply_column_visibility()
+        self._apply_filters()
 
     def _on_readonly_edit(self, row, col):
         if self._ask_yesno(
@@ -829,6 +1086,7 @@ class OrderWindow(tk.Toplevel):
                          json.dumps(self.grid.col_widths))
         except Exception:
             pass
+        self._update_filter_layout()
 
     def _load_grid_widths(self):
         try:

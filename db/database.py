@@ -26,7 +26,7 @@ def get_db_path():
 def get_connection():
     """Get a SQLite connection with WAL mode and foreign keys enabled."""
     db_path = get_db_path()
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=15.0)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
@@ -41,8 +41,23 @@ def backup_database():
     import time
     ts = time.strftime("%Y%m%d_%H%M%S")
     bak_path = db_path + ".{}.bak".format(ts)
-    shutil.copy2(db_path, bak_path)
-    return bak_path
+    # WAL 模式下必须用 sqlite3 原生 backup，shutil.copy2 会复制出损坏文件
+    try:
+        src_conn = sqlite3.connect(db_path)
+        dest_conn = sqlite3.connect(bak_path)
+        with dest_conn:
+            src_conn.backup(dest_conn)
+        src_conn.close()
+        dest_conn.close()
+        return bak_path
+    except Exception:
+        import sys
+        try:
+            from logic.logger import log_error
+            log_error(*sys.exc_info(), extra_info=u"数据库备份失败")
+        except ImportError:
+            pass
+        return None
 
 
 def init_database():
@@ -207,6 +222,32 @@ def run_migrations():
             conn.commit()
         except Exception:
             conn.execute("ROLLBACK TO mig_customer_code")
+
+        # v7: add needs_price to customer
+        try:
+            conn.execute("SAVEPOINT mig_needs_price")
+            cust_cols = [c[1] for c in conn.execute(
+                "PRAGMA table_info(customer)").fetchall()]
+            if "needs_price" not in cust_cols:
+                conn.execute(
+                    "ALTER TABLE customer ADD COLUMN"
+                    " needs_price INTEGER NOT NULL DEFAULT 0")
+            conn.commit()
+        except Exception:
+            conn.execute("ROLLBACK TO mig_needs_price")
+        # 防卡顿优化：为高频查询字段建立底层索引
+        for sql in [
+            "CREATE INDEX IF NOT EXISTS idx_order_date ON orders(order_date)",
+            "CREATE INDEX IF NOT EXISTS idx_order_status ON orders(status)",
+            "CREATE INDEX IF NOT EXISTS idx_product_model ON product(model_number)",
+            "CREATE INDEX IF NOT EXISTS idx_product_name ON product(product_name)",
+            "CREATE INDEX IF NOT EXISTS idx_dn_date ON delivery_note(delivery_date)",
+        ]:
+            try:
+                conn.execute(sql)
+            except Exception:
+                pass
+        conn.commit()
     finally:
         conn.close()
 

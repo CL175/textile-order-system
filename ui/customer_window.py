@@ -21,8 +21,8 @@ class CustomerWindow(tk.Toplevel):
         self._editing_id = None
 
         self.title(u"客户管理")
-        self.geometry("860x520")
-        self.minsize(780, 440)
+        self.geometry("960x640")
+        self.minsize(860, 560)
         self.transient(parent)
 
         self._build()
@@ -79,7 +79,7 @@ class CustomerWindow(tk.Toplevel):
 
         # -- Right: Form --
         # 【修改点3】：把右侧表单区域的宽度从 280 拉宽到 360，彻底解决列3被切掉的问题
-        right = tk.Frame(body, width=420)
+        right = tk.Frame(body, width=480)
         right.pack(side=tk.RIGHT, fill=tk.Y, padx=(12, 0))
         right.pack_propagate(False)
 
@@ -99,6 +99,12 @@ class CustomerWindow(tk.Toplevel):
         self.var_prefix = tk.StringVar()
         ttk.Entry(form, textvariable=self.var_prefix, width=10).pack(
             anchor=tk.W, pady=(2, 0))
+
+        # Needs price checkbox
+        self.var_needs_price = tk.IntVar()
+        ttk.Checkbutton(form, text=u"需要价格（开启后订单明细的单价列高亮提醒）",
+                        variable=self.var_needs_price).pack(
+            anchor=tk.W, pady=(10, 0))
 
         # Column name config — presets + manual fields
         tk.Label(form, text=u"送货单列名 (按客户习惯):",
@@ -140,17 +146,12 @@ class CustomerWindow(tk.Toplevel):
                 (u"列2(订单号):", self.var_dn_col1),
                 (u"列3(制单号):", self.var_dn_col2),
                 (u"列4(款号):", self.var_dn_col3)]):
-            col = i * 2
-            if col >= 8:
-                # Wrap to row 1 if more than 4 pairs
-                r = 1
-                col = (i - 4) * 2
-            else:
-                r = 0
+            r, c = divmod(i, 2)  # 2 per row
+            col = c * 2
             tk.Label(cols_frame, text=label,
                      font=("Microsoft YaHei", 8)).grid(
-                row=r, column=col, padx=(0 if col == 0 else 8, 2))
-            ttk.Entry(cols_frame, textvariable=var, width=8).grid(
+                row=r, column=col, padx=(0 if col == 0 else 12, 2))
+            ttk.Entry(cols_frame, textvariable=var, width=10).grid(
                 row=r, column=col + 1)
 
         # Buttons
@@ -205,6 +206,7 @@ class CustomerWindow(tk.Toplevel):
                 self._editing_id = cid
                 self.var_name.set(c["name"])
                 self.var_prefix.set(c["prefix"])
+                self.var_needs_price.set(c.get("needs_price", 0))
                 # Parse dn_headers and set fields + preset dropdown
                 raw = c.get("dn_headers") or u",订单号,,款号"
                 headers = raw.split(",")
@@ -229,6 +231,7 @@ class CustomerWindow(tk.Toplevel):
         self._editing_id = None
         self.var_name.set("")
         self.var_prefix.set("")
+        self.var_needs_price.set(0)
         self.var_dn_col0.set(u"")
         self.var_dn_col1.set(u"订单号")
         self.var_dn_col2.set(u"")
@@ -245,6 +248,12 @@ class CustomerWindow(tk.Toplevel):
             messagebox.showwarning(u"提示", u"请输入前缀（如 HR、YL）。")
             return
 
+        # Duplicate name check
+        for c in self._customers:
+            if c["name"] == name and c["id"] != self._editing_id:
+                messagebox.showwarning(u"提示", u"客户名称 '{}' 已存在，不能重复创建。".format(name))
+                return
+
         kwargs = {
             "dn_headers": ",".join([
                 self.var_dn_col0.get().strip(),
@@ -252,6 +261,7 @@ class CustomerWindow(tk.Toplevel):
                 self.var_dn_col2.get().strip(),
                 self.var_dn_col3.get().strip(),
             ]),
+            "needs_price": int(self.var_needs_price.get()),
         }
 
         try:

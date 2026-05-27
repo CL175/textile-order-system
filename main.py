@@ -52,6 +52,16 @@ def main():
     except Exception:
         pass
 
+    # 系统守护：每日无感备份 + 自动清理旧备份
+    try:
+        from utils.sys_guard import auto_backup_db
+        auto_backup_db(
+            db_path=os.path.join(_APP_DIR, "textile.db"),
+            backup_dir=os.path.join(_APP_DIR, "backup"),
+            keep_days=7)
+    except Exception:
+        pass
+
     # Seed default data if empty
     _seed_defaults()
 

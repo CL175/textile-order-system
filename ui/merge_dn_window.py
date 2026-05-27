@@ -16,7 +16,7 @@ import datetime
 
 from db.models import (Customer, Order, OrderItem, Product, Color,
                        DeliveryNote, DNItem, DeliveryNoteOrder,
-                       deduplicate_dn_items)
+                       deduplicate_dn_items, get_column_visibility)
 from logic.order_number import generate_delivery_number
 
 
@@ -38,6 +38,10 @@ class MergeDeliveryNoteWindow(tk.Toplevel):
         tk.Toplevel.__init__(self, parent)
         self._orders = orders  # list of order dicts, all same customer
         self._customer = Customer.get_by_id(orders[0]["customer_id"])
+        if not self._customer:
+            messagebox.showerror(u"错误", u"客户数据不存在，无法合并。")
+            self.destroy()
+            return
 
         self.title(u"合并送货 – {}".format(self._customer["name"]))
         sw = self.winfo_screenwidth()
@@ -58,6 +62,14 @@ class MergeDeliveryNoteWindow(tk.Toplevel):
         # Calculate column widths based on content
         self.col_widths = self._calc_widths()
 
+        # Hide code columns where customer hasn't set a label
+        if self._customer:
+            vis = get_column_visibility(self._customer.get("dn_headers", ""))
+            code_cols = [1, 2, 3, 4]  # 客户号, 订单号, 制单号, 款号
+            for i, visible in enumerate(vis):
+                if not visible:
+                    self.col_widths[code_cols[i]] = 0
+
         self._build()
         self._draw_all()
 
@@ -75,15 +87,23 @@ class MergeDeliveryNoteWindow(tk.Toplevel):
         widths = list(self.MIN_WIDTHS)
         for ci, header in enumerate(self.COLUMNS):
             # Header width
-            max_w = hdr_font.measure(header) + 20
+            max_w = hdr_font.measure(header) + 30
             # Data width
             for o, oi, checked in self._items:
                 text = self._col_text(ci, o, oi)
-                w = cell_font.measure(str(text)) + 20
+                w = cell_font.measure(str(text)) + 40
                 if w > max_w:
                     max_w = w
-            # Clamp between min and max
-            max_col_w = 400 if ci == 4 else 200  # 品名 can be wider
+
+            if ci == 5:
+                max_col_w = 550  # 品名
+            elif ci == 8:
+                max_col_w = 350  # 备注
+            elif ci == 4:
+                max_col_w = 250  # 款号
+            else:
+                max_col_w = 200
+
             widths[ci] = max(self.MIN_WIDTHS[ci], min(max_w, max_col_w))
         return widths
 
@@ -122,6 +142,13 @@ class MergeDeliveryNoteWindow(tk.Toplevel):
             font=("Microsoft YaHei", 12, "bold"),
             bg="#1a5276", fg="white", anchor=tk.W).pack(
                 side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # 浅黄色过滤框容器
+        self._filter_bar = tk.Frame(self, bg="#e8e8e8", height=38)
+        self._filter_bar.pack(fill=tk.X, padx=8, pady=(4, 0))
+        self._filter_bar.pack_propagate(False)
+        self._filter_entries = {}
+        self._build_filter_bar()
 
         # -- Scrollable content area --
         container = ttk.Frame(self)
@@ -165,18 +192,64 @@ class MergeDeliveryNoteWindow(tk.Toplevel):
         ttk.Button(ft, text=u"取消",
                    command=self.destroy).pack(side=tk.RIGHT, padx=2)
 
+    def _build_filter_bar(self):
+        for w in self._filter_bar.winfo_children():
+            w.destroy()
+        self._filter_entries.clear()
+
+        filter_cols = [1, 2, 3, 4, 5, 6, 7, 8]
+        for ci in filter_cols:
+            var = tk.StringVar()
+            var.trace("w", lambda *a, c=ci: self._apply_filters())
+            entry = tk.Entry(self._filter_bar, textvariable=var, width=6,
+                             font=("Microsoft YaHei", 10), bg="#ffffcc",
+                             relief="solid", borderwidth=1)
+            self._filter_entries[ci] = (var, entry)
+
+        self._clear_btn = ttk.Button(self._filter_bar, text=u"一键清空",
+                                    command=self._clear_filters)
+        self._update_filter_layout()
+
+    def _update_filter_layout(self):
+        """根据最新列宽对齐浅黄色过滤框"""
+        x_offset = 0
+        for i in range(len(self.COLUMNS)):
+            w = self.col_widths[i] if i < len(self.col_widths) else 80
+            if i in self._filter_entries and w > 0:
+                var, entry = self._filter_entries[i]
+                entry.place(x=x_offset + 2, y=4, width=w - 4, height=30)
+            elif i in self._filter_entries:
+                self._filter_entries[i][1].place_forget()
+            x_offset += w
+        self._clear_btn.place(x=x_offset + 10, y=4, height=30)
+
+    def _apply_filters(self):
+        """直接触发重绘，在重绘时自动过滤掉不匹配的行"""
+        self._draw_all()
+
+    def _clear_filters(self):
+        for var, _ in self._filter_entries.values():
+            var.set("")
+        self._apply_filters()
+
     def _draw_all(self):
         for w in self._content_frame.winfo_children():
             w.destroy()
 
+        # 收集当前用户填写的过滤条件
+        filters = {}
+        if hasattr(self, '_filter_entries'):
+            for ci, (var, _) in self._filter_entries.items():
+                kw = var.get().strip().lower()
+                if kw:
+                    filters[ci] = kw
+
         total_w = sum(self.col_widths)
 
         # Fonts
-        hdr_font = tkfont.Font(family="Microsoft YaHei", size=10,
-                               weight="bold")
+        hdr_font = tkfont.Font(family="Microsoft YaHei", size=10, weight="bold")
         cell_font = tkfont.Font(family="Microsoft YaHei", size=10)
-        sep_font = tkfont.Font(family="Microsoft YaHei", size=10,
-                               weight="bold")
+        sep_font = tkfont.Font(family="Microsoft YaHei", size=10, weight="bold")
 
         # Column header
         x = 0
@@ -185,21 +258,40 @@ class MergeDeliveryNoteWindow(tk.Toplevel):
             lbl = tk.Label(self._content_frame, text=header,
                            font=hdr_font, bg="#d0d0d0", fg="#333",
                            relief="groove", borderwidth=1,
-                           anchor=tk.CENTER,
-                           justify=tk.CENTER)
+                           anchor=tk.CENTER, justify=tk.CENTER)
             lbl.place(x=x, y=0, width=w, height=HEADER_H)
-            # Center text vertically by using a compound approach
+            if ci == self.CHECK_COL:
+                lbl.bind("<Double-1>", lambda e: self._toggle_all_visible())
             x += w
 
-        # Draw rows grouped by order
         y = HEADER_H
+        self._visible_indices = []  # 记录当前可见行的全局索引，供双击全选用
 
         for order in self._orders:
+            order_items = [(idx, item) for idx, item in enumerate(self._items)
+                          if item[0]["id"] == order["id"]]
+
+            # 利用过滤条件筛选行
+            visible_items = []
+            for gi, (o, oi, checked) in order_items:
+                match = True
+                for ci, kw in filters.items():
+                    val = str(self._col_text(ci, o, oi)).lower()
+                    if kw not in val:
+                        match = False
+                        break
+                if match:
+                    visible_items.append((gi, o, oi, checked))
+                    self._visible_indices.append(gi)
+
+            # 如果这个订单里的物料全被过滤掉了，直接跳过，连标题灰条也不显示！
+            if not visible_items:
+                continue
+
             # ---- Separator bar ----
             sep_text = u"▬▬ {}  ({})".format(
                 order["display_name"], order.get("order_date", ""))
-            sep_frame = tk.Frame(self._content_frame, bg="#9e9e9e",
-                                 height=SEP_H)
+            sep_frame = tk.Frame(self._content_frame, bg="#9e9e9e", height=SEP_H)
             sep_frame.place(x=0, y=y, width=total_w, height=SEP_H)
             sep_frame.pack_propagate(False)
             sep_lbl = tk.Label(sep_frame, text=sep_text,
@@ -209,11 +301,8 @@ class MergeDeliveryNoteWindow(tk.Toplevel):
             y += SEP_H
 
             # ---- Data rows for this order ----
-            order_items = [(idx, item) for idx, item in enumerate(self._items)
-                          if item[0]["id"] == order["id"]]
-
-            for item_idx, (gi, (o, oi, checked)) in enumerate(order_items):
-                bg = "#ffffff" if item_idx % 2 == 0 else "#f6f6f6"
+            for visible_count, (gi, o, oi, checked) in enumerate(visible_items):
+                bg = "#ffffff" if visible_count % 2 == 0 else "#f6f6f6"
                 chk_char = u"☑" if checked else u"☐"
                 fg_chk = "#006600" if checked else "#aaaaaa"
 
@@ -242,10 +331,8 @@ class MergeDeliveryNoteWindow(tk.Toplevel):
                     w = self.col_widths[ci]
                     lbl = tk.Label(self._content_frame, text=str(text),
                                    font=cell_font, bg=bg, fg=fg,
-                                   anchor=anchor,
-                                   justify=tk.CENTER,
-                                   relief="solid",
-                                   borderwidth=1)
+                                   anchor=anchor, justify=tk.CENTER,
+                                   relief="solid", borderwidth=1)
                     lbl.place(x=x, y=y, width=w, height=ROW_H)
                     if ci == self.CHECK_COL:
                         lbl.bind("<Button-1>",
@@ -272,6 +359,19 @@ class MergeDeliveryNoteWindow(tk.Toplevel):
         if global_idx < len(self._items):
             self._items[global_idx][2] = not self._items[global_idx][2]
             self._draw_all()
+
+    def _toggle_all_visible(self):
+        """双击"选"列表头：反选当前过滤后可见的所有行"""
+        visible = getattr(self, '_visible_indices', [])
+        if not visible:
+            return
+        all_checked = all(
+            gi < len(self._items) and self._items[gi][2] for gi in visible)
+        new_val = not all_checked
+        for gi in visible:
+            if gi < len(self._items):
+                self._items[gi][2] = new_val
+        self._draw_all()
 
     def _select_all(self):
         for item in self._items:
@@ -326,7 +426,7 @@ class MergeDeliveryNoteWindow(tk.Toplevel):
 
                 dn_str = generate_delivery_number(customer["id"], None)
                 if not dn_str:
-                    self.after(0, lambda: messagebox.showwarning(
+                    self._safe_ui(lambda: messagebox.showwarning(
                         u"错误", u"无法生成送货单号。"))
                     return
 
@@ -391,6 +491,24 @@ class MergeDeliveryNoteWindow(tk.Toplevel):
                     conn.execute(
                         "INSERT OR IGNORE INTO color (name) VALUES (?)", (cn,))
 
+                    # 在"合并送货"生成时，强行把 1+1 变成 2，并生成件数备注
+                    from logic.formula import parse_formula
+                    q_raw = item["quantity_formula"]
+                    res = parse_formula(q_raw)
+                    if not res.get("error"):
+                        q = float(res["quantity"])
+                        q_formula_pushed = str(int(q)) if q.is_integer() else str(q)
+                    else:
+                        try:
+                            q = float(q_raw) if q_raw else 0.0
+                        except ValueError:
+                            q = 0.0
+                        q_formula_pushed = q_raw
+
+                    final_notes = item["notes"]
+                    if not final_notes and q_raw:
+                        final_notes = res.get("notes", "")
+
                     conn.execute(
                         "INSERT INTO delivery_note_item"
                         " (delivery_note_id, order_item_id,"
@@ -404,8 +522,10 @@ class MergeDeliveryNoteWindow(tk.Toplevel):
                          "" if not item["model_number"] else (pr["model_number"] if pr else mn),
                          item["item_code"],
                          item.get("customer_code", ""),
-                         pn, cn, item["quantity_formula"],
-                         item["quantity"], item["notes"],
+                         pn, cn,
+                         q_formula_pushed,
+                         q,
+                         final_notes,
                          item["mfg_number"],
                          idx, now, now))
 
@@ -440,11 +560,11 @@ class MergeDeliveryNoteWindow(tk.Toplevel):
                 except Exception:
                     pass
                 import traceback
-                self.after(0, lambda: messagebox.showerror(
+                self._safe_ui(lambda: messagebox.showerror(
                     u"生成失败", str(e) + "\n" + traceback.format_exc()))
             finally:
                 conn.close()
-                self.after(0, lambda: self._safe_ui(
+                self._safe_ui(lambda: self._safe_ui(
                     lambda: (self.config(cursor=""),
                              self._gen_btn.config(state=tk.NORMAL))))
 
@@ -453,9 +573,14 @@ class MergeDeliveryNoteWindow(tk.Toplevel):
         t.start()
 
     def _safe_ui(self, fn):
-        def _run():
-            try:
-                fn()
-            except tk.TclError:
-                pass
-        self.after(0, _run)
+        """线程安全的 UI 更新：双重拦截 TclError 与窗口销毁异常"""
+        try:
+            if self.winfo_exists():
+                def _run():
+                    try:
+                        fn()
+                    except tk.TclError:
+                        pass
+                self.after(0, _run)
+        except Exception:
+            pass

@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Excel-like data grid with visible borders, inline editing, scrollbar."""
+"""Excel-like data grid with Dual-Mode (Selection/Edit), inline editing, and IME protection."""
 try:
     import Tkinter as tk
     import tkFont as tkfont
 except ImportError:
     import tkinter as tk
     import tkinter.font as tkfont
-
+import time
 
 ROW_H = 50
 HEADER_H = 36
@@ -16,13 +16,7 @@ class ExcelGrid(tk.Frame):
 
     def __init__(self, parent, columns, col_widths, checkbox_col=None,
                  search_cols=None, extra_checkbox_cols=None,
-                 read_only_cols=None):
-        """
-        columns: list of header strings
-        col_widths: list of pixel widths per column
-        checkbox_col: index of checkbox toggle column (optional)
-        search_cols: dict {col_idx: callback(row, col)} for double-click search
-        """
+                 read_only_cols=None, highlight_cols=None):
         tk.Frame.__init__(self, parent, bg="white")
 
         self.columns = columns
@@ -31,35 +25,39 @@ class ExcelGrid(tk.Frame):
         self.search_cols = search_cols or {}
         self.extra_checkbox_cols = set(extra_checkbox_cols or [])
         self.read_only_cols = set(read_only_cols or [])
+        self.highlight_cols = set(highlight_cols or [])
 
-        # Internal data: list of lists
+        # Data
         self._data = []
 
-        # Editing state
+        # Dual-Mode State
+        self._selected_cell = None  # tuple: (row, col)
         self._edit_entry = None
         self._edit_row = None
         self._edit_col = None
 
+        # IME Protection
+        self._last_edit_time = 0
+
         # Fonts
-        self._hdr_font = tkfont.Font(family="Microsoft YaHei", size=10,
-                                      weight="bold")
+        self._hdr_font = tkfont.Font(family="Microsoft YaHei", size=10, weight="bold")
         self._cell_font = tkfont.Font(family="Microsoft YaHei", size=10)
-        self._bold_font = tkfont.Font(family="Microsoft YaHei", size=10,
-                                      weight="bold")
+        self._bold_font = tkfont.Font(family="Microsoft YaHei", size=10, weight="bold")
 
         # Colors
         self._hdr_bg = "#e8e8e8"
         self._cell_white = "#ffffff"
         self._cell_alt = "#f8f8f8"
+        self._cell_highlight = "#fff9c4"  # 浅黄色高亮，提醒填写
         self._border_color = "#c0c0c0"
+        self._sel_color = "#00B050"  # Office 鲜绿色
 
-        self.on_cell_changed = None  # callback(row, col, new_value)
-        self.summary_text = ""       # set to show summary row at bottom
-        self._display_overrides = {}  # {(row,col): display_text} for formula cols
+        self.on_cell_changed = None
+        self.summary_text = ""
+        self._display_overrides = {}
         self.read_only = False
-        self.on_edit_blocked = None  # called when edit attempted in read_only mode
+        self.on_edit_blocked = None
 
-        # Sort state
         self._sort_col = None
         self._sort_desc = False
 
@@ -72,152 +70,185 @@ class ExcelGrid(tk.Frame):
         self.header_frame.pack(fill=tk.X, side=tk.TOP)
         self.header_frame.pack_propagate(False)
 
-        # Scrollable data
+        # Container
         container = tk.Frame(self)
         container.pack(fill=tk.BOTH, expand=True, side=tk.TOP)
 
-        self.canvas = tk.Canvas(
-            container, bg="white", highlightthickness=0, bd=0)
-        self.scrollbar = tk.Scrollbar(
-            container, orient=tk.VERTICAL, command=self.canvas.yview)
+        self.canvas = tk.Canvas(container, bg="white", highlightthickness=0, bd=0)
+        self.canvas.config(takefocus=True)  # CRITICAL: Allow canvas to capture key events
+
+        self.scrollbar = tk.Scrollbar(container, orient=tk.VERTICAL, command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
 
         self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self.data_frame = tk.Frame(self.canvas, bg="white")
-        self._canvas_win = self.canvas.create_window(
-            (0, 0), window=self.data_frame, anchor=tk.NW)
+        self._canvas_win = self.canvas.create_window((0, 0), window=self.data_frame, anchor=tk.NW)
 
-        self.canvas.bind("<Configure>",
-                         lambda e: self.canvas.itemconfig(
-                             self._canvas_win, width=e.width))
-        self.data_frame.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(
-                scrollregion=self.canvas.bbox("all")))
-        self._mw_binding = self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        # Canvas Resizing & Scrolling
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfig(self._canvas_win, width=e.width))
+        self.data_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+
+        # Mousewheel: bind to ALL layers so scrolling works wherever the mouse is
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.data_frame.bind("<MouseWheel>", self._on_mousewheel)
-        # Bind <Enter> to ensure focus for mouse wheel on Windows
+        self.bind("<MouseWheel>", self._on_mousewheel)
+
+        # Click empty space to gain focus
+        self.canvas.bind("<Button-1>", lambda e: self.canvas.focus_set())
         self.canvas.bind("<Enter>", lambda e: self.canvas.focus_set())
 
+        # ==========================================
+        # Navigation Keyboard Bindings (Selection Mode)
+        # ==========================================
+        self.canvas.bind("<Up>", self._nav_up)
+        self.canvas.bind("<Down>", self._nav_down)
+        self.canvas.bind("<Left>", self._nav_left)
+        self.canvas.bind("<Right>", self._nav_right)
+        self.canvas.bind("<Return>", self._nav_enter)
+        self.canvas.bind("<Tab>", self._nav_tab)
+        self.canvas.bind("<Control-c>", self._copy_cell)
+        self.canvas.bind("<Control-C>", self._copy_cell)
+        self.canvas.bind("<Control-x>", self._cut_cell)
+        self.canvas.bind("<Control-X>", self._cut_cell)
+        self.canvas.bind("<Control-v>", self._paste_cell)
+        self.canvas.bind("<Control-V>", self._paste_cell)
+        self.canvas.bind("<Key>", self._on_canvas_key)
+
     def _on_mousewheel(self, event):
-        """Mouse wheel scroll handler — works on canvas and all children."""
-        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.canvas.yview_scroll(int(-3 * (event.delta / 120)), "units")
 
     # ================================================================
-    # Drawing
+    # Drawing & Selection Box
     # ================================================================
     def draw(self):
+        if self._edit_entry:
+            self._commit_edit()
+
         self._clear()
         self._draw_header()
         self._draw_rows()
         self._draw_summary()
+        self._update_selection_box()
+
         tw = sum(self.col_widths)
         n = len(self._data)
-        extra = 2 if self.summary_text else 0
-        th = (n + extra) * ROW_H + 4
-        tw = max(tw, 100)
-        th = max(th, 20)
-        self.data_frame.config(width=tw, height=th)
-        self.canvas.configure(scrollregion=(0, 0, tw, th))
+        th = (n + (2 if self.summary_text else 0)) * ROW_H + 4
+        self.data_frame.config(width=max(tw, 100), height=max(th, 20))
+        self.canvas.configure(scrollregion=(0, 0, max(tw, 100), max(th, 20)))
         self.data_frame.update_idletasks()
 
-    def _draw_summary(self):
-        if not self.summary_text:
-            return
-        n = len(self._data)
-        # Blank separator row
-        y_sep = n * ROW_H
-        tk.Label(self.data_frame, text="", bg="#f0f0f0",
-                 relief="solid", borderwidth=1).place(
-                     x=0, y=y_sep,
-                     width=sum(self.col_widths), height=ROW_H)
-        # Summary row
-        y_sum = (n + 1) * ROW_H
-        lbl = tk.Label(self.data_frame, text=self.summary_text,
-                       font=self._bold_font, bg="#e8e8e8", fg="#333333",
-                       relief="solid", borderwidth=1, anchor=tk.W)
-        lbl.place(x=0, y=y_sum,
-                  width=sum(self.col_widths), height=ROW_H)
-
     def _clear(self):
-        for w in self.header_frame.winfo_children():
-            w.destroy()
-        for w in self.data_frame.winfo_children():
-            w.destroy()
+        for w in self.header_frame.winfo_children(): w.destroy()
+        for w in self.data_frame.winfo_children(): w.destroy()
 
+    def _update_selection_box(self):
+        """Draw the Excel-style green selection border."""
+        if hasattr(self, '_sel_borders'):
+            for b in self._sel_borders:
+                try: b.destroy()
+                except Exception: pass
+        self._sel_borders = []
+
+        if not self._selected_cell: return
+        r, c = self._selected_cell
+        if r >= len(self._data) or c >= len(self.columns): return
+
+        # Create 4 independent lines so we don't cover cell text
+        for _ in range(4):
+            self._sel_borders.append(tk.Frame(self.data_frame, bg=self._sel_color))
+
+        x = sum(self.col_widths[:c])
+        y = r * ROW_H
+        w = self.col_widths[c]
+
+        bw = 3  # 边框粗细
+        self._sel_borders[0].place(x=x, y=y, width=w, height=bw)                 # Top
+        self._sel_borders[1].place(x=x, y=y+ROW_H-bw, width=w, height=bw)        # Bottom
+        self._sel_borders[2].place(x=x, y=y, width=bw, height=ROW_H)             # Left
+        self._sel_borders[3].place(x=x+w-bw, y=y, width=bw, height=ROW_H)        # Right
+
+        for b in self._sel_borders:
+            b.bind("<MouseWheel>", self._on_mousewheel)
+            b.lift()
+
+    def _ensure_visible(self, r, c):
+        """Auto-scroll if the selection moves out of bounds."""
+        self.canvas.update_idletasks()
+        y_top = r * ROW_H
+        y_bottom = y_top + ROW_H
+        canvas_h = self.canvas.winfo_height()
+        if canvas_h <= 1: return
+
+        yview = self.canvas.yview()
+        total_h = self.data_frame.winfo_height()
+        if total_h <= 0: return
+
+        view_top = yview[0] * total_h
+        view_bottom = yview[1] * total_h
+
+        if y_top < view_top:
+            self.canvas.yview_moveto(float(y_top) / total_h)
+        elif y_bottom > view_bottom:
+            self.canvas.yview_moveto(float(y_bottom - canvas_h + 10) / total_h)
+
+    def _draw_summary(self):
+        if not self.summary_text: return
+        n = len(self._data)
+        tk.Label(self.data_frame, text="", bg="#f0f0f0", relief="solid", borderwidth=1).place(
+            x=0, y=n*ROW_H, width=sum(self.col_widths), height=ROW_H)
+        tk.Label(self.data_frame, text=self.summary_text, font=self._bold_font,
+                 bg="#e8e8e8", fg="#333", relief="solid", borderwidth=1, anchor=tk.W).place(
+                     x=0, y=(n+1)*ROW_H, width=sum(self.col_widths), height=ROW_H)
+
+    # ---- Header & Resize ----
     def _draw_header(self):
         x = 0
         arrow = u" ▼" if self._sort_desc else u" ▲"
         for ci, header in enumerate(self.columns):
             w = self.col_widths[ci]
             text = header + arrow if ci == self._sort_col else header
-            lbl = tk.Label(
-                self.header_frame, text=text, font=self._hdr_font,
-                bg=self._hdr_bg, fg="#333333",
-                relief="groove", borderwidth=1, anchor=tk.CENTER,
-                justify=tk.CENTER)
+            lbl = tk.Label(self.header_frame, text=text, font=self._hdr_font,
+                           bg=self._hdr_bg, fg="#333333", relief="groove", borderwidth=1)
             lbl.place(x=x, y=0, width=w, height=HEADER_H)
             lbl.bind("<Button-1>", lambda e, col=ci: self._header_click(col))
-            # Double-click header to select all (for checkbox cols)
             if ci == self.checkbox_col or ci in self.extra_checkbox_cols:
                 lbl.bind("<Double-1>", lambda e, col=ci: self._header_dbl_click(col))
 
-            # Resize handle at right edge (20px wide, easier to grab)
-            handle = tk.Frame(self.header_frame, bg="#a0a0a0",
-                              cursor="sb_h_double_arrow")
+            handle = tk.Frame(self.header_frame, bg="#a0a0a0", cursor="sb_h_double_arrow")
             handle.place(x=x + w - 10, y=0, width=20, height=HEADER_H)
-            handle.bind("<Button-1>",
-                       lambda e, col=ci: self._resize_start(e, col))
-            handle.bind("<B1-Motion>", self._resize_move)
-            handle.bind("<ButtonRelease-1>", self._resize_end)
+            handle.bind("<Button-1>", lambda e, col=ci: self._resize_start(e, col))
             handle.lift()
-
             x += w
 
     def _header_dbl_click(self, col):
-        """Double-click checkbox header → toggle all."""
         current = self._data[0][col] if self._data else u"☐"
         new_val = u"☑" if current == u"☐" else u"☐"
         for ri in range(len(self._data)):
             if len(self._data[ri]) > col:
                 self._data[ri][col] = new_val
+                if self.on_cell_changed:
+                    self.on_cell_changed(ri, col, new_val)
         self.draw()
 
     def _header_click(self, col):
-        """Single-click header → sort by that column."""
-        if col == self.checkbox_col or col in self.extra_checkbox_cols:
-            return  # don't sort checkbox cols
-        if self._sort_col == col:
-            self._sort_desc = not self._sort_desc
-        else:
-            self._sort_col = col
-            self._sort_desc = False
+        if col == self.checkbox_col or col in self.extra_checkbox_cols: return
+        if self._sort_col == col: self._sort_desc = not self._sort_desc
+        else: self._sort_col = col; self._sort_desc = False
         self._sort_data()
         self.draw()
 
     def _sort_data(self):
-        if self._sort_col is None or not self._data:
-            return
+        if self._sort_col is None or not self._data: return
         ci = self._sort_col
-
         def _key(row):
-            if ci >= len(row):
-                return ""
-            v = row[ci]
-            if isinstance(v, (int, float)):
-                return (0, v, "")
-            s = str(v)
-            # Try numeric sort
-            try:
-                return (0, float(s), "")
-            except ValueError:
-                return (1, 0, s.lower())
-
+            v = row[ci] if ci < len(row) else ""
+            if isinstance(v, (int, float)): return (0, v, "")
+            try: return (0, float(str(v)), "")
+            except ValueError: return (1, 0, str(v).lower())
         self._data.sort(key=_key, reverse=self._sort_desc)
 
-    # ---- Column resize ----
     _resize_col = None
     _resize_start_x = 0
     _resize_start_w = 0
@@ -226,186 +257,223 @@ class ExcelGrid(tk.Frame):
         self._resize_col = col
         self._resize_start_x = event.x_root
         self._resize_start_w = self.col_widths[col]
+        self._rb_motion = self.bind_all("<B1-Motion>", self._resize_move)
+        self._rb_release = self.bind_all("<ButtonRelease-1>", self._resize_end)
 
     def _resize_move(self, event):
-        if self._resize_col is None:
-            return
+        if self._resize_col is None: return
         dx = event.x_root - self._resize_start_x
-        new_w = max(20, self._resize_start_w + dx)
-        self.col_widths[self._resize_col] = new_w
+        self.col_widths[self._resize_col] = max(20, self._resize_start_w + dx)
         self.draw()
 
     def _resize_end(self, event):
         self._resize_col = None
-        if hasattr(self, 'on_resize_done'):
-            self.on_resize_done()
+        self.unbind_all("<B1-Motion>")
+        self.unbind_all("<ButtonRelease-1>")
+        if hasattr(self, 'on_resize_done'): self.on_resize_done()
 
+    # ---- Cell Rendering ----
     def _draw_rows(self):
         for ri in range(len(self._data)):
             self._draw_row(ri)
 
     def _fit_text(self, text, max_width):
-        """Truncate text with … so it fits within max_width pixels."""
-        if not text:
-            return ""
+        if not text: return ""
         text = str(text)
-        if self._cell_font.measure(text) <= max_width - 8:
-            return text
-        # Binary search for the right length
+        if self._cell_font.measure(text) <= max_width - 8: return text
         lo, hi = 0, len(text)
         while lo < hi:
             mid = (lo + hi + 1) // 2
-            if self._cell_font.measure(text[:mid] + u"…") <= max_width - 8:
-                lo = mid
-            else:
-                hi = mid - 1
+            if self._cell_font.measure(text[:mid] + u"…") <= max_width - 8: lo = mid
+            else: hi = mid - 1
         return text[:lo] + u"…" if lo > 0 else u"…"
 
     def _draw_row(self, ri):
-        bg = self._cell_white if ri % 2 == 0 else self._cell_alt
         row_data = self._data[ri]
         y = ri * ROW_H
         x = 0
 
         for ci in range(len(self.columns)):
             w = self.col_widths[ci]
-            # Use display override if exists, otherwise actual data
             override = self._display_overrides.get((ri, ci))
-            val = override if override is not None else (
-                row_data[ci] if ci < len(row_data) else "")
+            val = override if override is not None else (row_data[ci] if ci < len(row_data) else "")
+            bg = self._cell_highlight if ci in self.highlight_cols else (
+                self._cell_white if ri % 2 == 0 else self._cell_alt)
 
             if ci == self.checkbox_col or ci in self.extra_checkbox_cols:
-                is_on = (val == u"☑")
-                fg = "#006600" if is_on else "#aaaaaa"
-                c = tk.Label(self.data_frame, text=str(val),
-                            font=self._cell_font, bg=bg, fg=fg,
-                            anchor=tk.CENTER,
-                            relief="solid", borderwidth=1)
-                c.place(x=x, y=y, width=w, height=ROW_H)
-                c.bind("<Button-1>", lambda e, r=ri, col=ci:
-                       self._toggle_chk(r, col))
-                c.bind("<MouseWheel>", self._on_mousewheel)
+                fg = "#006600" if val == u"☑" else "#aaaaaa"
+                c = tk.Label(self.data_frame, text=str(val), font=self._cell_font, bg=bg, fg=fg,
+                             relief="solid", borderwidth=1)
+                c.bind("<Button-1>", lambda e, r=ri, col=ci: self._on_chk_click(r, col))
             else:
-                display = self._fit_text(val, w)
-                c = tk.Label(self.data_frame, text=display,
-                            font=self._cell_font, bg=bg, fg="#333333",
-                            anchor=tk.CENTER,
-                            relief="solid", borderwidth=1)
-                c.place(x=x, y=y, width=w, height=ROW_H)
-                c.bind("<Button-1>",
-                       lambda e, r=ri, col=ci: self._click(r, col))
-                c.bind("<MouseWheel>", self._on_mousewheel)
-                if ci in self.search_cols:
-                    c.bind("<Double-1>",
-                           lambda e, r=ri, col=ci: self._dbl_click(r, col))
+                c = tk.Label(self.data_frame, text=self._fit_text(val, w), font=self._cell_font,
+                             bg=bg, fg="#333", relief="solid", borderwidth=1)
+                c.bind("<Button-1>", lambda e, r=ri, col=ci: self._on_cell_click(r, col))
+                c.bind("<Double-1>", lambda e, r=ri, col=ci: self._on_cell_dbl_click(r, col))
 
+            c.place(x=x, y=y, width=w, height=ROW_H)
+            c.bind("<MouseWheel>", self._on_mousewheel)
             x += w
 
     # ================================================================
-    # Data access
+    # Interaction & Navigation (The Excel Logic)
     # ================================================================
-    def get_data(self):
-        return [list(row) for row in self._data]
+    def _set_selection(self, r, c):
+        if self._edit_entry: self._commit_edit()
+        self._selected_cell = (r, c)
+        self._update_selection_box()
+        self._ensure_visible(r, c)
+        self.canvas.focus_set()
 
-    def set_data(self, data):
-        self._data = [list(row) for row in data]
+    def _on_cell_click(self, r, c):
+        self._set_selection(r, c)
+
+    def _on_chk_click(self, r, c):
+        self._set_selection(r, c)
+        if self.read_only:
+            if self.on_edit_blocked: self.on_edit_blocked(r, c)
+            return
+        cur = self._data[r][c]
+        new_val = u"☐" if cur == u"☑" else u"☑"
+        self.set_cell(r, c, new_val)
         self.draw()
+        if self.on_cell_changed: self.on_cell_changed(r, c, new_val)
 
-    def get_cell(self, row, col):
-        if row < len(self._data) and col < len(self._data[row]):
-            return self._data[row][col]
-        return ""
-
-    def set_cell(self, row, col, value):
-        while row >= len(self._data):
-            self._data.append([u"☐" if i == self.checkbox_col else ""
-                              for i in range(len(self.columns))])
-        while col >= len(self._data[row]):
-            self._data[row].append("")
-        self._data[row][col] = value
-
-    def set_display_override(self, row, col, text):
-        """Set a display override (what's shown vs what's stored)."""
-        if text:
-            self._display_overrides[(row, col)] = text
+    def _on_cell_dbl_click(self, r, c):
+        if self.read_only or c in self.read_only_cols:
+            if self.on_edit_blocked: self.on_edit_blocked(r, c)
+            return
+        if c in self.search_cols:
+            self._set_selection(r, c)
+            self.search_cols[c](r, c)
         else:
-            self._display_overrides.pop((row, col), None)
+            self._start_edit(r, c, clear=False)
 
-    def clear_overrides(self):
-        self._display_overrides.clear()
+    def _nav_up(self, e):
+        if self._selected_cell:
+            r, c = self._selected_cell
+            if r > 0: self._set_selection(r-1, c)
+        return "break"
 
-    def row_count(self):
-        return len(self._data)
+    def _nav_down(self, e):
+        if self._selected_cell:
+            r, c = self._selected_cell
+            if r < len(self._data) - 1: self._set_selection(r+1, c)
+            else: self.add_row(); self._set_selection(r+1, c)
+        return "break"
 
-    # ================================================================
-    # Row operations
-    # ================================================================
-    def add_row(self, values=None):
-        if values:
-            self._data.append(list(values))
-        else:
-            row = []
-            for i in range(len(self.columns)):
-                if i == self.checkbox_col or i in self.extra_checkbox_cols:
-                    row.append(u"☐")
-                else:
-                    row.append("")
-            self._data.append(row)
-        self.draw()
-        self._scroll_bottom()
+    def _nav_left(self, e):
+        if self._selected_cell:
+            r, c = self._selected_cell
+            if c > 0: self._set_selection(r, c-1)
+        return "break"
 
-    def delete_rows(self, indices):
-        for ri in sorted(indices, reverse=True):
-            if ri < len(self._data):
-                self._data.pop(ri)
-        self.draw()
+    def _nav_right(self, e):
+        if self._selected_cell:
+            r, c = self._selected_cell
+            if c < len(self.columns) - 1: self._set_selection(r, c+1)
+        return "break"
 
-    def get_selected_rows(self):
-        """Return indices of rows with checkbox checked."""
-        if self.checkbox_col is None:
-            return []
-        return [ri for ri, row in enumerate(self._data)
-                if ri < len(row) and row[self.checkbox_col] == u"☑"]
+    def _nav_enter(self, e):
+        return self._nav_down(e)
 
-    def get_all_rows(self):
-        return self.get_data()
+    def _nav_tab(self, e):
+        if self._selected_cell:
+            r, c = self._selected_cell
+            if c < len(self.columns) - 1:
+                self._set_selection(r, c+1)
+            elif r < len(self._data) - 1:
+                self._set_selection(r+1, 0)
+        return "break"
 
-    # ================================================================
-    # Interaction
-    # ================================================================
-    def commit_edit(self):
-        """Flush any pending edit to underlying data.  Call before get_data()."""
-        self._commit_edit()
+    def _on_canvas_key(self, e):
+        """Direct typing to edit cell (Excel feature)."""
+        if not self._selected_cell or self._edit_entry: return
 
-    def _click(self, row, col):
-        if self.read_only:
-            if self.on_edit_blocked:
-                self.on_edit_blocked(row, col)
+        # 强行捕获空格键，直接激活编辑模式（Win7 上空格可能不被 isprintable 识别）
+        if e.keysym == "space":
+            r, c = self._selected_cell
+            if c in self.read_only_cols or self.read_only: return
+            if c == self.checkbox_col or c in self.extra_checkbox_cols: return
+            if c in self.search_cols: return
+            self._start_edit(r, c, clear=True, initial_char=" ")
+            return "break"
+
+        # 如果按住 Ctrl 或 Alt，不触发打字（放行给复制粘贴快捷键）
+        if e.state & 0x0004 or e.state & 0x0008:
             return
-        if col in self.read_only_cols:
-            return  # frozen column
-        self._start_edit(row, col)
 
-    def _dbl_click(self, row, col):
-        if self.read_only:
-            if self.on_edit_blocked:
-                self.on_edit_blocked(row, col)
+        # Ignore control keys
+        if e.keysym in ("Up", "Down", "Left", "Right", "Return", "Tab", "Escape",
+                        "Shift_L", "Shift_R", "Control_L", "Alt_L", "BackSpace", "Delete"):
+            if e.keysym in ("BackSpace", "Delete"):
+                r, c = self._selected_cell
+                if not self.read_only and c not in self.read_only_cols:
+                    self.set_cell(r, c, "")
+                    self.draw()
+                    if self.on_cell_changed: self.on_cell_changed(r, c, "")
             return
-        if col in self.search_cols:
-            self.search_cols[col](row, col)
 
-    def _toggle_chk(self, row, col):
-        if self.read_only:
-            if self.on_edit_blocked:
-                self.on_edit_blocked(row, col)
-            return
-        if row < len(self._data) and col < len(self._data[row]):
-            cur = self._data[row][col]
-            self._data[row][col] = u"☐" if cur == u"☑" else u"☑"
+        # Printable character check
+        if e.char and e.char.isprintable():
+            r, c = self._selected_cell
+            if c in self.read_only_cols or self.read_only: return
+            if c == self.checkbox_col or c in self.extra_checkbox_cols: return
+            if c in self.search_cols: return # Search cols must be double clicked
+
+            self._start_edit(r, c, clear=True, initial_char=e.char)
+
+    # ================================================================
+    # Edit Mode & IME Defense
+    # ================================================================
+    def _copy_cell(self, event=None):
+        """Ctrl+C 复制当前格内容到剪贴板"""
+        if not self._selected_cell or self._edit_entry:
+            return "break"
+        r, c = self._selected_cell
+        val = self.get_cell(r, c)
+        self.clipboard_clear()
+        self.clipboard_append(str(val) if val is not None else "")
+        return "break"
+
+    def _cut_cell(self, event=None):
+        """Ctrl+X 剪切"""
+        if not self._selected_cell or self._edit_entry:
+            return "break"
+        self._copy_cell()
+        r, c = self._selected_cell
+        if not self.read_only and c not in self.read_only_cols:
+            self.set_cell(r, c, "")
             self.draw()
+            if self.on_cell_changed:
+                self.on_cell_changed(r, c, "")
+        return "break"
 
-    def _start_edit(self, row, col):
+    def _paste_cell(self, event=None):
+        """Ctrl+V 粘贴剪贴板内容到当前格"""
+        if not self._selected_cell or self._edit_entry:
+            return "break"
+        r, c = self._selected_cell
+        if self.read_only or c in self.read_only_cols:
+            if self.on_edit_blocked: self.on_edit_blocked(r, c)
+            return "break"
+        if c == self.checkbox_col or c in self.extra_checkbox_cols:
+            return "break"
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            text = ""
+        if text:
+            text = text.replace("\n", " ").replace("\r", "").strip()
+            self.set_cell(r, c, text)
+            self.draw()
+            if self.on_cell_changed:
+                self.on_cell_changed(r, c, text)
+        return "break"
+
+    def _start_edit(self, row, col, clear=False, initial_char=""):
         self._commit_edit()
+        self._selected_cell = (row, col)
         self._edit_row = row
         self._edit_col = col
 
@@ -413,44 +481,90 @@ class ExcelGrid(tk.Frame):
         y = row * ROW_H
         x = sum(self.col_widths[i] for i in range(col))
 
-        # Show actual stored value (not display override) for editing
-        if row < len(self._data) and col < len(self._data[row]):
-            current = self._data[row][col]
-        else:
-            current = ""
+        current = self._data[row][col] if row < len(self._data) and col < len(self._data[row]) else ""
 
-        e = tk.Entry(self.data_frame, font=self._cell_font,
-                     bg="#ffffcc", relief="solid", borderwidth=2)
-        e.place(x=x + 1, y=y + 1, width=w - 2, height=ROW_H - 2)
+        # Using Excel green highlight for typing indicator
+        e = tk.Entry(self.data_frame, font=self._cell_font, bg="#ffffff",
+                     relief="solid", borderwidth=1, highlightthickness=2,
+                     highlightcolor=self._sel_color)
+        e.place(x=x, y=y, width=w, height=ROW_H)
+
         e.insert(0, str(current) if current else "")
-        e.select_range(0, tk.END)
+        if clear:
+            e.delete(0, tk.END)
+            e.insert(0, initial_char)
+            e.icursor(tk.END)
+        else:
+            e.select_range(0, tk.END)
+            e.icursor(tk.END)
+
         e.focus_set()
 
-        e.bind("<Return>", lambda ev: self._commit_edit())
-        e.bind("<Escape>", lambda ev: self._cancel_edit())
-        e.bind("<FocusOut>", lambda ev: self._commit_edit())
-        e.bind("<Tab>",
-               lambda ev, r=row, c=col: self._tab_next(r, c))
+        self._last_edit_time = time.time()
 
+        def _on_key(ev):
+            # Track typing time to defend against IME Return event
+            self._last_edit_time = time.time()
+
+        e.bind("<Key>", _on_key)
+        e.bind("<Return>", self._on_entry_return)
+        e.bind("<Escape>", lambda ev: self._cancel_edit())
+        e.bind("<Up>", self._on_entry_up)
+        e.bind("<Down>", self._on_entry_down)
+        e.bind("<Tab>", self._on_entry_tab)
         self._edit_entry = e
 
+    def _on_entry_return(self, ev):
+        """Smart Enter: Ignores IME composition commit, otherwise moves down."""
+        # IME Protection: If text was changed in the last 50ms, it's likely an IME commit.
+        if time.time() - self._last_edit_time < 0.05:
+            return "break"
+
+        self._commit_edit()
+        r, c = self._selected_cell
+        if r < len(self._data) - 1:
+            self._set_selection(r+1, c)
+        else:
+            self.add_row()
+            self._set_selection(r+1, c)
+        return "break"
+
+    def _on_entry_up(self, ev):
+        self._commit_edit()
+        r, c = self._selected_cell
+        if r > 0: self._set_selection(r-1, c)
+        return "break"
+
+    def _on_entry_down(self, ev):
+        return self._on_entry_return(ev)
+
+    def _on_entry_tab(self, ev):
+        self._commit_edit()
+        r, c = self._selected_cell
+        if c < len(self.columns) - 1: self._set_selection(r, c+1)
+        return "break"
+
+    def commit_edit(self):
+        self._commit_edit()
+
     def _commit_edit(self):
-        if not self._edit_entry:
-            return
-        try:
-            new_val = self._edit_entry.get()
-        except tk.TclError:
-            new_val = ""
+        if not self._edit_entry: return
+        try: new_val = self._edit_entry.get()
+        except tk.TclError: new_val = ""
+
         self._edit_entry.destroy()
         self._edit_entry = None
-
-        if self._edit_row is not None:
-            self.set_cell(self._edit_row, self._edit_col, new_val)
-            self.draw()
-            if self.on_cell_changed:
-                self.on_cell_changed(self._edit_row, self._edit_col, new_val)
+        r, c = self._edit_row, self._edit_col
         self._edit_row = None
         self._edit_col = None
+
+        if r is not None and c is not None:
+            self.set_cell(r, c, new_val)
+            self.draw()
+            if self.on_cell_changed:
+                self.on_cell_changed(r, c, new_val)
+
+        self.canvas.focus_set()
 
     def _cancel_edit(self):
         if self._edit_entry:
@@ -458,17 +572,39 @@ class ExcelGrid(tk.Frame):
             self._edit_entry = None
         self._edit_row = None
         self._edit_col = None
+        self.canvas.focus_set()
 
-    def _tab_next(self, row, col):
-        self._commit_edit()
-        nc = col + 1
-        nr = row
-        if nc >= len(self.columns):
-            nc = 1 if self.checkbox_col == 0 else 0
-            nr += 1
-        if nr < len(self._data):
-            self.after(50, lambda: self._start_edit(nr, nc))
+    # ================================================================
+    # Data Access APIs
+    # ================================================================
+    def get_data(self): return [list(row) for row in self._data]
+    def set_data(self, data): self._data = [list(row) for row in data]; self.draw()
+    def get_cell(self, row, col):
+        return self._data[row][col] if row < len(self._data) and col < len(self._data[row]) else ""
+    def set_cell(self, row, col, value):
+        while row >= len(self._data):
+            self._data.append([u"☐" if i == self.checkbox_col or i in self.extra_checkbox_cols else "" for i in range(len(self.columns))])
+        while col >= len(self._data[row]): self._data[row].append("")
+        self._data[row][col] = value
+    def set_display_override(self, row, col, text):
+        if text: self._display_overrides[(row, col)] = text
+        else: self._display_overrides.pop((row, col), None)
+    def clear_overrides(self): self._display_overrides.clear()
+    def set_highlight_cols(self, cols):
+        self.highlight_cols = set(cols or [])
+        self.draw()
+    def row_count(self): return len(self._data)
 
-    def _scroll_bottom(self):
-        self.canvas.update_idletasks()
-        self.canvas.yview_moveto(1.0)
+    def add_row(self, values=None):
+        if values: self._data.append(list(values))
+        else: self._data.append([u"☐" if i == self.checkbox_col or i in self.extra_checkbox_cols else "" for i in range(len(self.columns))])
+        self.draw()
+
+    def delete_rows(self, indices):
+        for ri in sorted(indices, reverse=True):
+            if ri < len(self._data): self._data.pop(ri)
+        self.draw()
+
+    def get_selected_rows(self):
+        if self.checkbox_col is None: return []
+        return [ri for ri, row in enumerate(self._data) if ri < len(row) and row[self.checkbox_col] == u"☑"]

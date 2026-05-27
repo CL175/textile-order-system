@@ -26,7 +26,7 @@ if %errorlevel% neq 0 (
 )
 
 echo Building...
-%PY% -m PyInstaller --onefile --windowed --name fangzhi --add-data "data;data" --hidden-import win32com --hidden-import win32com.client --hidden-import win32gui --hidden-import win32con --hidden-import pywinauto --hidden-import openpyxl --hidden-import xlrd --hidden-import xlwt --hidden-import xlutils --hidden-import xlutils.copy --hidden-import pythoncom main.py
+%PY% -m PyInstaller --clean --onefile --windowed --uac-admin --name fangzhi --add-data "data;data" --hidden-import win32com --hidden-import win32com.client --hidden-import win32gui --hidden-import win32con --hidden-import pywinauto --hidden-import openpyxl --hidden-import xlrd --hidden-import xlwt --hidden-import xlutils --hidden-import xlutils.copy --hidden-import pythoncom main.py
 
 if %errorlevel% equ 0 (
     if exist "dist\fangzhi.exe" move /y "dist\fangzhi.exe" "dist\fangzhi_app.exe" >nul 2>&1

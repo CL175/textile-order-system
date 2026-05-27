@@ -41,26 +41,28 @@ def import_customers(filepath):
     added = 0
     skipped = 0
 
-    for name in names:
-        # Check if already exists
-        existing = conn.execute(
-            "SELECT COUNT(*) FROM customer WHERE name=?", (name,)
-        ).fetchone()[0]
-        if existing:
-            skipped += 1
-            continue
+    try:
+        for name in names:
+            # Check if already exists
+            existing = conn.execute(
+                "SELECT COUNT(*) FROM customer WHERE name=?", (name,)
+            ).fetchone()[0]
+            if existing:
+                skipped += 1
+                continue
 
-        prefix = get_prefix(name)
-        conn.execute(
-            "INSERT INTO customer (name, prefix, has_model_number, has_item_code)"
-            " VALUES (?,?,?,?)",
-            (name, prefix, 0, 0))
-        print(u"  + {}  [{}]".format(name, prefix))
-        added += 1
+            prefix = get_prefix(name)
+            conn.execute(
+                "INSERT INTO customer (name, prefix, has_model_number, has_item_code)"
+                " VALUES (?,?,?,?)",
+                (name, prefix, 0, 0))
+            print(u"  + {}  [{}]".format(name, prefix))
+            added += 1
 
-    total = conn.execute("SELECT COUNT(*) FROM customer").fetchone()[0]
-    conn.commit()
-    conn.close()
+        total = conn.execute("SELECT COUNT(*) FROM customer").fetchone()[0]
+        conn.commit()
+    finally:
+        conn.close()
 
     print(u"\nDone: {} added, {} skipped (already exist)".format(added, skipped))
     print(u"Total customers in DB: {}".format(total))

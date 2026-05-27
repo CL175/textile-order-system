@@ -47,8 +47,14 @@ def _wrap_product(text, max_chars):
 
 def _get_fmt():
     import win32com.client
-    bt = win32com.client.Dispatch("BarTender.Application")
-    fmt = bt.ActiveFormat
+    try:
+        bt = win32com.client.Dispatch("BarTender.Application")
+    except Exception as e:
+        raise RuntimeError(u"连接 BarTender 底层服务失败，请确认软件已正常打开。\n系统报错: {}".format(str(e)))
+    try:
+        fmt = bt.ActiveFormat
+    except Exception as e:
+        raise RuntimeError(u"读取 BarTender 模板状态失败，可能软件已卡死。\n系统报错: {}".format(str(e)))
     if fmt is None:
         raise RuntimeError(
             u"BarTender 中没有打开的标签模板。\n"
@@ -90,11 +96,11 @@ def _do_printout(fmt, count=1):
         app = Application(backend="win32").connect(title_re=".*BarTender.*", timeout=3)
         main_win = app.top_window()
         main_win.set_focus()
-        time.sleep(0.3)
+        time.sleep(0.2)
 
         # 2. 模拟按下 Ctrl + P 快捷键
         send_keys('^p')
-        time.sleep(1.2) # 等待打印对话框弹出（稍微加长以确保弹窗稳定）
+        time.sleep(0.6)
 
         # 3. 捕获弹出的"打印"窗口，确保焦点没跑偏
         try:
@@ -105,32 +111,29 @@ def _do_printout(fmt, count=1):
 
         # 4. 直接输入打印份数
         send_keys(str(count))
-        time.sleep(0.5)
+        time.sleep(0.2)
 
         # 5. 提交打印（双重保险）
         clicked = False
         if print_dlg:
-            # 第一重保险：直接抓取名为"打印"的按钮，模拟真实鼠标点击
             for btn_title in [u"打印", u"打印(&P)"]:
                 try:
                     btn = print_dlg.child_window(title=btn_title, class_name="Button")
                     if btn.exists():
                         btn.set_focus()
-                        time.sleep(0.2)
-                        send_keys('{SPACE}')  # 物理鼠标左键点击
+                        time.sleep(0.1)
+                        send_keys('{SPACE}')
                         clicked = True
                         break
                 except Exception:
                     continue
 
         if not clicked:
-            # 第二重保险：键盘外挂兜底。按 Tab 键把光标从输入框移出，再回车
             send_keys('{TAB}')
             time.sleep(0.1)
             send_keys('{ENTER}')
 
-        # 6. 给系统和打印机留出足够的缓冲时间 (非常关键，防止连续打印时出现跳单)
-        time.sleep(3.5)
+        time.sleep(1.0)
 
         return True
     except Exception as e:
